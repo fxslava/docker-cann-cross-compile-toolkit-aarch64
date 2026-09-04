@@ -5,9 +5,10 @@
 #   docker run --rm vllm-ascend-310p:aarch64-offline verify
 #   docker run --rm --entrypoint verify-runtime.sh <image>
 #
-# Everything here works without an NPU, so it is equally valid on the x86_64
-# build host under QEMU and on the target Ascend server. Checks that genuinely
-# need hardware are reported as INFO, never as failures.
+# The script runs on the x86_64 build host under QEMU as well as on the target
+# Ascend server. Checks that genuinely need hardware are reported as INFO, never
+# as failures, so a clean run on the build host is not a claim that the NPU
+# works -- only that the image is complete.
 #
 # Exits non-zero if any check fails.
 # ---------------------------------------------------------------------------
@@ -19,6 +20,11 @@ info() { echo "  [INFO] $*"; }
 step() { echo; echo "=== $* ==="; }
 
 TK="${ASCEND_TOOLKIT_HOME:-/usr/local/Ascend/ascend-toolkit/latest}"
+
+# Counted up front because step 5 has to know: the native extension can only be
+# loaded where a device exists.
+NDEV=0
+for dev in /dev/davinci[0-9]*; do [ -c "$dev" ] && NDEV=$((NDEV+1)); done
 
 step "1. Platform"
 arch=$(uname -m)
@@ -84,11 +90,53 @@ dt=$(python3 -c "from vllm_ascend import _build_info; print(_build_info.__device
     || bad "vllm_ascend built for '${dt:-unknown}', expected _310P"
 
 step "5. Compiled extension"
-if python3 -c "import vllm_ascend.vllm_ascend_C" 2>/tmp/ext.log; then
-    ok "vllm_ascend_C native extension loads"
+# libvllm_ascend_kernels.so, which vllm_ascend_C pulls in, registers its device
+# binaries from an ELF constructor that first calls AscendCheckSoCVersion(). On
+# a host with no NPU aclrtGetSocName() returns NULL, that check builds a
+# std::string from it, and the process dies with
+#   terminate called after throwing an instance of 'std::logic_error'
+#   what():  basic_string::_S_construct null not valid
+# before Python sees anything it could catch. That is a property of the CANN
+# runtime, not of this image, so only assert the import where a device exists.
+# It is also why nothing in Dockerfile.aarch64 imports vllm_ascend_C: the build
+# host has no NPU. `ldd -r` still proves the module has no unresolved symbols
+# of its own, which is the part a build host can honestly check.
+ext_so=$(python3 - <<'PY' 2>/dev/null
+import glob, os, vllm_ascend
+d = os.path.dirname(vllm_ascend.__file__)
+print((glob.glob(os.path.join(d, "vllm_ascend_C*.so")) or [""])[0])
+PY
+)
+if [ -n "$ext_so" ] && [ -f "$ext_so" ]; then
+    ok "vllm_ascend_C built into the wheel ($(basename "$ext_so"))"
+    # libtorch/libtorch_npu live in the wheels, not on the default search path,
+    # so tell ldd where they are or every torch symbol reads as unresolved.
+    torch_libs=$(python3 - <<'PY' 2>/dev/null
+import os, torch, torch_npu
+print(":".join(os.path.join(os.path.dirname(m.__file__), "lib")
+                for m in (torch, torch_npu)))
+PY
+)
+    unresolved=$(LD_LIBRARY_PATH="$torch_libs:$(dirname "$ext_so"):${LD_LIBRARY_PATH:-}" \
+        ldd -r "$ext_so" 2>&1 | grep "undefined symbol" | grep -vcE "undefined symbol: _?Py")
+    if [ "${unresolved:-1}" -eq 0 ]; then
+        ok "vllm_ascend_C has no unresolved symbols beyond the Python API"
+    else
+        bad "vllm_ascend_C has $unresolved unresolved non-Python symbols"
+    fi
 else
-    bad "vllm_ascend_C native extension does not load"
-    tail -5 /tmp/ext.log
+    bad "vllm_ascend_C native extension was not built"
+fi
+
+if [ "$NDEV" -gt 0 ]; then
+    if python3 -c "import vllm_ascend.vllm_ascend_C" 2>/tmp/ext.log; then
+        ok "vllm_ascend_C native extension loads"
+    else
+        bad "vllm_ascend_C native extension does not load"
+        tail -5 /tmp/ext.log
+    fi
+else
+    info "skipping the vllm_ascend_C import: no NPU, so CANN's SoC check aborts"
 fi
 
 step "6. vLLM entrypoint"
@@ -99,10 +147,8 @@ else
 fi
 
 step "7. NPU hardware (informational)"
-ndev=0
-for dev in /dev/davinci[0-9]*; do [ -c "$dev" ] && ndev=$((ndev+1)); done
-if [ "$ndev" -gt 0 ]; then
-    info "$ndev NPU device node(s) visible"
+if [ "$NDEV" -gt 0 ]; then
+    info "$NDEV NPU device node(s) visible"
     python3 -c "import torch, torch_npu; print('  [INFO] torch_npu device_count:', torch.npu.device_count())" 2>/dev/null \
         || info "torch.npu.device_count() unavailable (driver not mounted?)"
 else

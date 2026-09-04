@@ -45,10 +45,12 @@ echo "[wheels] pip    $(python3 -m pip --version)"
 echo "[wheels] vllm   $(basename "$VLLM_WHL")"
 
 # vLLM and vllm-ascend are resolved SEPARATELY, and installed separately later,
-# because their metadata genuinely conflicts: vllm declares
-# fastapi[standard]>=0.133.0 while vllm-ascend declares fastapi<0.124.0.
-# Upstream's own Dockerfile.310p hits the same thing and lets the second
-# `pip install` win; a single joint resolve would simply fail.
+# because vllm-ascend pins the same packages more tightly than vLLM does
+# (numpy<2.0.0, fastapi<0.124.0, opencv-python-headless<=4.11.0.86) and must be
+# the one that wins -- the order upstream's own Dockerfile.310p uses. At some
+# version pairings the two are outright incompatible rather than merely
+# tighter, and then a single joint resolve fails instead of picking a side.
+# Resolving in two passes keeps both sets of wheels in the house either way.
 echo
 echo "[wheels] pass 1/3: vLLM runtime closure"
 pipdl "$VLLM_WHL"

@@ -1,0 +1,58 @@
+# ---------------------------------------------------------------------------
+# CANN 8.5.0 runtime libraries that Ascend-cann-toolkit_8.5.0_linux-aarch64.run
+# does NOT install, but that torch_npu links against.
+#
+# WHY THIS FILE EXISTS
+# Extracting all 21 component packages out of the toolkit .run and searching
+# them shows these libraries are simply not in it -- the aclnn operator API
+# (libopapi*), HCCL's aggregate libhccl.so, DVPP and a few others ship in the
+# separate kernels/opp component that Huawei does not publish at the OBS prefix
+# download_deps.sh uses. Huawei's own CANN 8.5.0 container image does carry
+# them, at the same version and architecture, so provision_deps_aarch64.sh
+# lifts them from there into deps/cann_extra/ (step 1b).
+#
+# Without them, `import torch` fails before anything else runs, because torch
+# auto-loads the torch_npu backend extension:
+#     ImportError: libtorch_npu.so: undefined symbol: HcclReduceScatter
+#     RuntimeError: libopapi.so: cannot open shared object file
+#
+# TO REGENERATE for another CANN version, diff the two lib64 listings:
+#   docker run --rm --platform linux/arm64 quay.io/ascend/cann:<ver>-310p-ubuntu22.04-py3.11 \
+#       ls /usr/local/Ascend/cann-<ver>/aarch64-linux/lib64 > /tmp/official
+#   docker run --rm <your toolkit-only image> \
+#       ls /usr/local/Ascend/ascend-toolkit/latest/lib64 > /tmp/ours
+#   comm -23 <(sort /tmp/official) <(sort /tmp/ours)
+#
+# The Dockerfile installs these with `cp -n`, so a CANN release that does ship
+# them in the toolkit is never overwritten.
+# ---------------------------------------------------------------------------
+
+# HCCL collective API. torch_npu resolves ten symbols here by name; the split
+# libhccl_{alg,fwk,legacy,plf}.so in the toolkit provide only four of them.
+libhccl.so
+
+# aclnn operator API - the single largest reason torch_npu will not load.
+libopapi.so
+libopapi_cv.so
+libopapi_math.so
+libopapi_nn.so
+libopapi_transformer.so
+libop_common.so
+libops_host_cpu.so
+libes_math.so
+libconstant_folding_ops.so
+
+# DVPP (vision pre/post-processing), pulled in by the acl DVPP entry points.
+libacl_dvpp.so
+libacl_dvpp_mpi.so
+libacl_dvpp_op.so
+libdvpp_op_base.so
+libdvpp_rtkernel.so
+libdvpp_cmdlist_v100.so
+libdvpp_cmdlist_v101.so
+libdvpp_cmdlist_v102.so
+libdvpp_cmdlist_v200.so
+
+# Distributed KV / interconnect helpers referenced by the runtime.
+libcann_hixl.so
+libllm_datadist.so

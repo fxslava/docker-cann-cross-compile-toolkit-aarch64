@@ -4,12 +4,15 @@
 #
 # Everything here must resolve to a cp310 / manylinux aarch64 wheel, because
 # the offline image installs with `pip install --no-index`.
+#
+# The torch stack matches vllm-ascend v0.13.0, the release upstream builds
+# against CANN 8.5.0. See constraints.aarch64.txt and README.aarch64.md.
 # ---------------------------------------------------------------------------
 
-# Build backend. setuptools is capped below 81 because vllm's own metadata
+# Build backend. setuptools is capped below 81 because vLLM's own metadata
 # declares setuptools<81.0.0 and a newer one makes the two installs disagree.
 pip
-setuptools>=77.0.3,<81.0.0
+setuptools>=64,<81.0.0
 setuptools-scm>=8
 wheel
 packaging
@@ -19,13 +22,14 @@ cmake>=3.26
 ninja
 pybind11
 
-# Torch stack.
-#   torch is pinned to the local-version build (torch-2.10.0+cpu-...aarch64.whl)
-#   that download_deps.sh fetches from download.pytorch.org. PEP 440 orders
-#   2.10.0+cpu above plain 2.10.0, so pip prefers the local file over PyPI once
-#   deps/python_wheels is on --find-links.
-torch==2.10.0+cpu
-torch-npu==2.10.0.post4
+# Torch stack. torch is pinned to the +cpu local-version build from
+# download.pytorch.org; constraints.aarch64.txt explains why that matters.
+torch==2.8.0+cpu
+torch-npu==2.8.0.post2
+
+# vllm-ascend v0.13.0 declares numpy<2.0.0 and CANN's TBE/op tooling is
+# validated against the 1.x ABI, so the two agree here.
+numpy<2.0.0
 
 # Imported by CANN's TBE/op tooling and by vllm-ascend's setup.py.
 attrs

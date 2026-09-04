@@ -22,6 +22,9 @@ deps/.provision
 !requirements.aarch64.txt
 !constraints.aarch64.txt
 
+# Local fixes applied to deps/src/vllm-ascend at build time.
+!patches
+
 # COPYed into the image.
 !entrypoint.sh
 !verify_runtime.sh

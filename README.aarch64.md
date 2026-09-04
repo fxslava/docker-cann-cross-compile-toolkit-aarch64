@@ -1,6 +1,6 @@
 # Native AArch64 Offline Inference Image for Ascend 310P3
 
-A `linux/arm64` Docker image built **on an x86_64 host under QEMU emulation**, carrying CANN 8.5.0, Python 3.10, PyTorch 2.10.0+cpu, `torch_npu`, upstream vLLM and the `vllm-ascend` plugin — all installed from local artefacts with **zero network access**, so the result can be exported to a tar and run on an air-gapped Ascend 310P3 server with a plain `vllm serve`.
+A `linux/arm64` Docker image built **on an x86_64 host under QEMU emulation**, carrying CANN 8.5.0, Python 3.10, PyTorch 2.8.0+cpu, `torch_npu` 2.8.0.post2, vLLM v0.13.0 and the `vllm-ascend` v0.13.0 plugin — all installed from local artefacts with **zero network access**, so the result can be exported to a tar and run on an air-gapped Ascend 310P3 server with a plain `vllm serve`.
 
 This is the sibling of the cross-compilation image documented in [README.md](README.md). They solve different problems:
 
@@ -17,6 +17,24 @@ This is the sibling of the cross-compilation image documented in [README.md](REA
 `vllm-ascend` cannot be cross-built. Its `CMakeLists.txt` runs `import torch` to check the version, and its `setup.py` shells out to `pip show torch-npu` to locate the target headers — build-host and target Python must therefore be the *same interpreter*. Building the whole thing as AArch64 also removes the `op_build` `dlopen` architecture mismatch, because `op_build` and the libraries it loads are then both AArch64.
 
 The cost is speed: every instruction runs through `qemu-aarch64`, so the build takes hours rather than minutes.
+
+### The version matrix is not negotiable
+
+CANN 8.5.0 is what this repository pins, and that choice fixes everything above it. `vllm-ascend` releases are built against one specific CANN, and the mismatch is not a soft one — `vllm-ascend` at `main` references `platform_ascendc::SocVersion::ASCEND950` in about twenty `csrc` files, an enum member CANN 8.5.0's headers do not define, so the ACLNN op build fails to compile outright.
+
+Upstream's own release-to-CANN mapping, read from each tag's `Dockerfile.310p`:
+
+| `vllm-ascend` | CANN | vLLM |
+|---|---|---|
+| v0.11.0 | 8.3.rc2 | v0.11.0 |
+| **v0.13.0** | **8.5.0** | **v0.13.0** |
+| v0.18.0 | 8.5.1 | v0.18.0 |
+| v0.21.0rc1 – v0.26.0rc1 | 9.1.0 | matching tag |
+| `main` | 9.1.0 | v0.27.1 |
+
+So this image pins the **v0.13.0** row: `vllm-ascend` v0.13.0, vLLM v0.13.0, torch 2.8.0, torch_npu 2.8.0.post2, numpy < 2. `vllm-ascend`'s `CMakeLists.txt` enforces the torch version itself (`FATAL_ERROR` unless it is exactly 2.8.0), so there is no room to drift on that one either.
+
+Moving to a newer torch or vLLM means moving CANN too — change `CANN_VERSION` in `download_deps.sh` (with a new SHA-256), then `VLLM_TAG` and `VLLM_ASCEND_REF` in `provision_deps_aarch64.sh`, as a set.
 
 ---
 
@@ -71,7 +89,7 @@ This is the only step that touches the network. It fills `./deps/` with everythi
 |---|---|
 | `deps/Ascend-cann-toolkit_8.5.0_linux-aarch64.run` | CANN toolkit, AArch64 (~1.1 GB, SHA-256 verified) |
 | `deps/apt_debs/` | arm64 `.deb` closure of `packages.aarch64.txt` + `dpkg-scanpackages` index |
-| `deps/python_wheels/` | cp310 / manylinux-aarch64 wheelhouse (torch, torch_npu, vLLM and every transitive dependency) |
+| `deps/python_wheels/` | cp310 / manylinux-aarch64 wheelhouse (torch 2.8.0+cpu, torch_npu, the vLLM wheel and every transitive dependency) |
 | `deps/src/vllm-ascend/` | `vllm-ascend` checkout **including the `catlass` submodule** |
 | `deps/MANIFEST.txt` | inventory of the above |
 
@@ -84,9 +102,8 @@ If you already have some artefacts locally, seed them and skip the downloads:
 
 ```bash
 CANN_RUN_SRC=~/cann-build/Ascend-cann-toolkit_8.5.0_linux-aarch64.run \
-TORCH_WHEEL_SRC=~/cann-build/torch-2.10.0+cpu-cp310-cp310-manylinux_2_28_aarch64.whl \
-VLLM_WHEEL=~/vllm-build/dist/vllm-0.27.1+empty-cp310-cp310-manylinux2014_aarch64.whl \
-VLLM_ASCEND_SRC=~/vllm-build/vllm-ascend \
+VLLM_WHEEL=~/vllm-build/dist/vllm-0.13.0+empty-cp310-cp310-manylinux2014_aarch64.whl \
+VLLM_SRC=~/vllm-build/vllm VLLM_ASCEND_SRC=~/vllm-build/vllm-ascend \
 ./provision_deps_aarch64.sh ./deps
 ```
 
@@ -96,7 +113,7 @@ vLLM does publish an aarch64 wheel on PyPI, but it is a **CUDA** build. The Asce
 
 ### Why `constraints.aarch64.txt` exists
 
-On aarch64 the `torch` wheels on PyPI are CUDA builds targeting GH200/Jetson. vLLM's `compressed-tensors==0.17.0` only asks for `torch>=2.10.0`, so an unconstrained resolve jumps to torch 2.14.0 and pulls in ~5 GB of `nvidia-*-cu13` wheels (cuDNN alone is 651 MB) that an Ascend NPU cannot use and that would shadow the CPU build `torch_npu` is compiled against. Pinning the `+cpu` local-version builds from `download.pytorch.org` keeps the whole CUDA subtree out.
+On aarch64 the `torch` wheels on PyPI are CUDA builds targeting GH200/Jetson. vLLM's `compressed-tensors` only declares a torch *lower* bound, so an unconstrained resolve jumps to the newest torch and pulls in ~5 GB of `nvidia-*-cu13` wheels (cuDNN alone is 651 MB) that an Ascend NPU cannot use and that would shadow the CPU build `torch_npu` is compiled against. Pinning `torch==2.8.0+cpu` from `download.pytorch.org` keeps the whole CUDA subtree out, and PyPI publishes no `2.8.0+cpu`, so the pin is unambiguous.
 
 ---
 
@@ -130,23 +147,35 @@ docker pull docker/dockerfile:1.7
 1. **apt, offline.** `deps/apt_debs` is exposed as a `deb [trusted=yes] file:/debs ./` repository and the packages in `packages.aarch64.txt` are installed as a normal apt transaction.
 2. **pip bootstrap, offline.** jammy ships pip 22.0.2, which chokes on `Metadata-Version: 2.4` wheels, so a newer pip is the first thing installed from the wheelhouse.
 3. **CANN.** `Ascend-cann-toolkit_8.5.0_linux-aarch64.run --full --quiet --install-path=/usr/local/Ascend --install-for-all`, running natively under emulation. `--full` rather than the narrower `--install` because `vllm-ascend`'s ACLNN custom-op build needs the development/op-package payload.
-4. **Python stack**, in three separate `pip install --no-index --find-links=/opt/wheels` transactions (see the note on fastapi below).
-5. **`vllm-ascend`**, built from `deps/src/vllm-ascend` for `SOC_VERSION=ascend310p3` and installed.
+4. **Python stack**, in three separate `pip install --no-index --find-links=/opt/wheels` transactions (see the note on precedence below).
+5. **`vllm-ascend`**, patched from `patches/`, then built from `deps/src/vllm-ascend` for `SOC_VERSION=ascend310p3` and installed.
 6. **Driver plumbing** — `HwHiAiUser` and friends, `/var/driver`, `/usr/slog`, `/lib64 -> /lib`.
 7. **A build-time import check.** The image cannot be produced unless `import torch, torch_npu, vllm, vllm_ascend` all succeed.
 
+### `vllm-ascend` needs patching to build for a 310P at all
+
+`deps/src/vllm-ascend` stays a pristine upstream checkout. The local changes live in `patches/` and are applied to the *copy* in stage 6, so re-provisioning never has to undo anything and bumping `VLLM_ASCEND_REF` only means rebasing the diff. Each patch carries its rationale in a header above the diff; `patches/0001-vllm-ascend-0.13.0-ascend310p-kernel-gates.patch` is the one that makes v0.13.0 build:
+
+* **The SoC gates never fire.** `CMakeLists.txt` reads `if(SOC_VERSION STREQUAL "ASCEND310P3")` while `setup.py` will only accept the lowercase spelling (see below), so the 910B-only kernels are handed to `ccec` for `dav-m200` and the build dies in `csrc/batch_matmul_transpose/op_kernel/` on `PIPE_FIX`, a synchronisation pipe that exists only on 910/910B. The patch folds the case once into a `SOC_IS_310P` flag that matches the whole 310P family.
+* **`mla_preprocess` is missing from the exclusion list.** Even with the gates firing, `csrc/mla_preprocess/op_kernel/mla_preprocess_kernel.cpp` is `ArchType::ASCEND_V220` code that instantiates `MLAOperation` over `__bf16` — a type the 310P AI Core does not have — so `ccec` rejects it with `unknown type name 'bfloat16_t'`. It is now excluded. (MLA is a DeepSeek path that does not run on a 310P regardless.) While there, the four LoRA entries in that list are respelled: they were written as `${KERNEL_FILES}/bgmv_expand.cpp`, and since `KERNEL_FILES` is a `;`-list of absolute paths that expands to the wrong set — it dropped `pos_encoding_kernels.cpp` and `get_masked_input_and_mask_kernel.cpp`, which *do* build for `dav-m200`, and kept one LoRA kernel, which does not. The LoRA kernels fail in the host stub pass, where `__CCE_AICORE__` is undefined so their `#if !defined(__CCE_AICORE__) || (__CCE_AICORE__ >= 220)` guard opens and the launch of `bgmv_shrink_bfloat16_t` comes out "not configured".
+* **The resulting module could not be imported.** The 310P branch also dropped `batch_matmul_transpose`'s host tiling TU while `csrc/torch_binding.cpp` still calls into it, leaving `vllm_ascend_C.so` with undefined `pp_matmul::GetPpMatmulTiling` and `pp_matmul::HardwareInfo::HardwareInfo`. That TU is ordinary host C++ and is now compiled on every SoC. A new `csrc/soc_stubs/unsupported_310p.cpp` supplies the six `*_impl` entry points of the excluded kernels, so the module links and a call raises a clear error rather than the whole extension failing to load. None of those ops is reachable on a 310P through `vllm-ascend`'s own dispatch — LoRA falls back to `vllm.lora.ops.torch_ops` in `vllm_ascend/lora/punica_npu.py`, and MLA and sparse attention are gated on `AscendDeviceType._310P`.
+
+`ldd -r` on the finished extension reports no unresolved symbols beyond the Python C API, which `verify_runtime.sh` asserts.
+
 ### Why `SOC_VERSION` is lowercase `ascend310p3`
 
-CANN spells the chip `Ascend310P3`, but `vllm-ascend` gates on the value twice with *case-sensitive* matches:
+CANN spells the chip `Ascend310P3`, and upstream's own `Dockerfile.310p` exports `ASCEND310P3` — but `vllm-ascend` v0.13.0 leaves no spelling that satisfies all of its readers at once:
 
-* `CMakeLists.txt`: `if(SOC_VERSION MATCHES "ascend310p.*")` decides to **skip** the `ascendc_library` kernel target — 310P has no MLAPO or `batch_matmul_transpose` support. `Ascend310P3` misses that branch and tries to build kernels the SoC does not have.
-* `csrc/build_aclnn.sh`: `[[ "$SOC_VERSION" =~ ^ascend310 ]]` selects the four 310P custom ACLNN ops and sets `SOC_ARG=ascend310p`.
+* `setup.py`'s `gen_build_info()` does `assert soc_version in soc_to_device` against an **all-lowercase** dict, and writes the resulting device family into `vllm_ascend/_build_info.py`. That file is what the runtime dispatches on, and `gen_build_info` runs from `build_py` — so on every `setup.py bdist_wheel`. `ASCEND310P3` fails that assert outright.
+* `CMakeLists.txt` gates its kernel-exclusion lists on `if(SOC_VERSION STREQUAL "ASCEND310P3")`, which no value the assert accepts can match.
 
-`vllm_ascend/device/hardware.py` lowercases before its own lookup, so `ascend310p3` is accepted everywhere and resolves to device family `_310P`. Same chip, spelling that satisfies every consumer.
+The two cannot both be satisfied as shipped. `ascend310p3` is the side worth keeping: it is the real chip, it passes the assert, it yields `__device_type__ = '_310P'` so the installed plugin dispatches as an Atlas 300I, and it is what CANN's `ascendc` cmake stamps into the kernel library's own SoC check. Getting `_build_info` wrong would mis-dispatch at inference time. `verify_runtime.sh` asserts the resulting `_310P`.
 
-### Why three pip transactions
+The CMake side is then fixed rather than worked around: the patch above replaces both `STREQUAL` gates with one case-insensitive flag, so the exclusion happens with the spelling `setup.py` demands.
 
-vLLM's metadata declares `fastapi[standard]>=0.133.0`; `vllm-ascend`'s `requirements.txt` declares `fastapi<0.124.0`. Those cannot both hold, so a single resolve simply fails. Upstream's own `Dockerfile.310p` hits the same conflict and lets the later install win — this image does the same, deliberately and with the reason written down.
+### Why three separate pip transactions
+
+`vllm-ascend` pins several packages more tightly than vLLM does — `numpy<2.0.0`, `fastapi<0.124.0`, `opencv-python-headless<=4.11.0.86` — and it has to be the side that wins, which is the order upstream's own `Dockerfile.310p` uses. At other version pairings the two are not merely tighter but incompatible (vLLM 0.27.1 wants `fastapi>=0.133.0` against `vllm-ascend`'s `<0.124.0`), and a single joint resolve fails outright instead of picking a side. Splitting the transactions makes the precedence explicit either way.
 
 `vllm-ascend` itself is installed with `--no-build-isolation --no-deps`: its `pyproject.toml` build-system requires `triton-ascend==3.2.2`, which is published only on Huawei's mirror and which upstream uninstalls again immediately afterwards. An isolated build environment would try to fetch it, and there is no network.
 
@@ -166,6 +195,15 @@ docker run --rm --network=none vllm-ascend-310p:aarch64-offline \
 ```
 
 Checks that genuinely need hardware are reported as `[INFO]`, never as failures, so the suite passes on the x86_64 build host too.
+
+**`import vllm_ascend.vllm_ascend_C` is one of those checks.** `libvllm_ascend_kernels.so` registers its device binaries from an ELF constructor that first calls CANN's `AscendCheckSoCVersion()`; with no NPU attached `aclrtGetSocName()` returns `NULL`, the check builds a `std::string` from it, and the process dies before Python sees anything it could catch:
+
+```text
+terminate called after throwing an instance of 'std::logic_error'
+  what():  basic_string::_S_construct null not valid
+```
+
+That is CANN's own generated stub, not anything specific to this image — which is why nothing in `Dockerfile.aarch64` imports `vllm_ascend_C`, and why `vllm_ascend/utils.py::enable_custom_op()` is deliberately lazy. On the build host the suite proves what a build host can honestly prove — the extension exists and `ldd -r` finds no unresolved symbols beyond the Python C API — and only asserts the import where `/dev/davinci*` exists.
 
 ---
 
@@ -265,6 +303,8 @@ packages.aarch64.txt           apt package list, shared by provisioning and buil
 requirements.aarch64.txt       torch stack + build backend pins
 requirements-optional.aarch64.txt  best-effort extras (a miss is not fatal)
 constraints.aarch64.txt        keeps the resolve on +cpu torch, off CUDA
+cann_extra.aarch64.txt         CANN libraries the toolkit .run omits
+patches/                       local fixes applied to vllm-ascend at build time
 entrypoint.sh                  NPU detection + vllm serve launcher
 verify_runtime.sh              in-image verification suite
 deps/                          provisioned payload (git-ignored)
@@ -278,4 +318,6 @@ deps/                          provisioned payload (git-ignored)
 * **`binfmt_misc` registration is not persistent.** After `wsl --shutdown` you must re-register; both scripts here do it for you.
 * **The `catlass` submodule must be present before the build.** `csrc/build_aclnn.sh` runs `git submodule update --init` when `csrc/third_party/catlass/include` is missing — which would need network inside the offline build. `provision_deps_aarch64.sh` clones with `--recurse-submodules` and fails loudly if it is absent.
 * **`deps/` is git-ignored.** It is provisioned, not committed: the CANN toolkit alone is 1.1 GB.
+* **The native extension cannot be imported on a machine with no NPU.** CANN's generated kernel-registration constructor aborts the process rather than returning an error; see the note in §5. It is not a symptom of a broken image, and it is why the build-time check stops at `import vllm_ascend`.
+* **`setuptools-scm` shells out to `git` during `bdist_wheel`.** The copy of `deps/src/vllm-ascend` keeps the upstream `.git`, owned by the provisioning user, so git refuses it as dubious ownership and the wheel step fails. Stage 6 deletes `.git` from the copy first; the version comes from `SETUPTOOLS_SCM_PRETEND_VERSION`, and `git apply` needs no repository.
 * **A wheel-only wheelhouse.** Everything is downloaded with `--only-binary=:all:` so the offline install never has to compile an sdist. Packages with no cp310 aarch64 wheel are listed in `requirements-optional.aarch64.txt`, downloaded one at a time, and recorded in `deps/MANIFEST.txt` when they are missing — none of them is needed for `import vllm_ascend` or for `vllm serve`.

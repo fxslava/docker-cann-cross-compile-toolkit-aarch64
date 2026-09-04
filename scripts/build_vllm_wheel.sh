@@ -25,9 +25,20 @@ mv -f /usr/sbin/ldconfig.orig /usr/sbin/ldconfig
 
 python3 -m pip install --no-cache-dir -q --upgrade pip setuptools setuptools-scm wheel
 
+# vLLM's setup.py does `import torch` at module scope even for the empty target
+# (it reads the version to stamp the wheel), so torch has to be present before
+# bdist_wheel runs. It is pinned to the same +cpu build the image installs, via
+# the shared constraints file, so the wheel is stamped against the stack it will
+# actually run on.
+python3 -m pip install --no-cache-dir -q \
+    --extra-index-url https://download.pytorch.org/whl/cpu \
+    --constraint /prov/constraints.aarch64.txt \
+    torch cmake ninja packaging jinja2 regex
+
 cd /src/vllm
 export VLLM_TARGET_DEVICE=empty
 git config --global --add safe.directory /src/vllm || true
+echo "[vllm] torch $(python3 -c 'import torch; print(torch.__version__)')"
 
 echo "[vllm] building $(git describe --tags 2>/dev/null || echo unknown) on $(uname -m)"
 python3 setup.py bdist_wheel --plat-name "${PLAT_NAME:-manylinux2014_aarch64}" -d /out

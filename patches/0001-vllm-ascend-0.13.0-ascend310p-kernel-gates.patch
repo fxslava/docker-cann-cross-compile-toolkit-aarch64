@@ -1,0 +1,209 @@
+vllm-ascend v0.13.0: make the Ascend 310P (dav-m200) build work
+
+Applied to deps/src/vllm-ascend by Dockerfile.aarch64 stage 6. Three defects
+stop `SOC_VERSION=ascend310p3 python3 setup.py bdist_wheel` from producing a
+loadable wheel on v0.13.0:
+
+  1. The SoC gates in CMakeLists.txt read `STREQUAL "ASCEND310P3"`, but
+     setup.py's gen_build_info() asserts SOC_VERSION against an all-lowercase
+     table, so no single spelling satisfies both. With the lowercase spelling
+     the gates never fire and 910B-only kernels are compiled for dav-m200.
+  2. Even when the gates do fire, csrc/mla_preprocess/op_kernel/
+     mla_preprocess_kernel.cpp is not in the exclusion list. It is
+     ArchType::ASCEND_V220 code that instantiates MLAOperation over __bf16, so
+     ccec rejects it for dav-m200 ("unknown type name 'bfloat16_t'"). The
+     exclusion list also mis-spells its four LoRA entries as
+     `${KERNEL_FILES}/bgmv_expand.cpp`, which expands to the wrong set of paths.
+  3. The 310P branch drops batch_matmul_transpose's host tiling TU while
+     csrc/torch_binding.cpp still calls into it, so vllm_ascend_C.so ends up
+     with undefined pp_matmul symbols and cannot be imported at all.
+
+Fix: derive one case-insensitive SOC_IS_310P flag; exclude exactly the kernels
+that cannot be built for dav-m200; keep every host TU; and add a stub TU that
+defines the *_impl entry points of the excluded kernels so the module links and
+raises a clear error instead of failing to load. None of the stubbed ops are
+reachable on a 310P through vllm-ascend's own Python dispatch.
+
+Upstream ref: v0.13.0 (6281c12). Rebase on any bump of VLLM_ASCEND_REF.
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 6c55d93..2cc6003 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -31,6 +31,19 @@ set(RUN_MODE "npu" CACHE STRING "cpu/sim/npu")
+ set(SOC_VERSION ${SOC_VERSION})
+ message(STATUS "Detected SOC version: ${SOC_VERSION}")
+ 
++# setup.py forwards the SOC_VERSION environment variable verbatim, and its
++# gen_build_info() asserts against an all-lowercase table ("ascend310p3"), so
++# the gates below cannot be spelled STREQUAL "ASCEND310P3" without forcing a
++# SOC_VERSION that makes `setup.py bdist_wheel` fail that assert. Fold the case
++# once here, and match the whole 310P family (310p1/310p3/310p5/310p7 and the
++# vir* variants) -- every member of it is AI Core arch dav-m200.
++string(TOLOWER "${SOC_VERSION}" SOC_VERSION_LOWER)
++set(SOC_IS_310P OFF)
++if(SOC_VERSION_LOWER MATCHES "^ascend310p")
++    set(SOC_IS_310P ON)
++endif()
++message(STATUS "Building for the 310P family: ${SOC_IS_310P}")
++
+ if (NOT CMAKE_BUILD_TYPE)
+   set(CMAKE_BUILD_TYPE "Release" CACHE STRINGS "Build type Release/Debug (default Release)" FORCE)
+ endif()
+@@ -61,15 +74,40 @@ set(VLLM_ASCEND_CUSTOM_OP
+     ${CMAKE_CURRENT_SOURCE_DIR}/csrc/batch_matmul_transpose/op_kernel/batch_matmul_transpose_kernel.cpp
+ )
+ 
++# Kernels that cannot be built for the 310P (AI Core arch dav-m200), spelled as
++# real paths. The four LoRA entries were written as
++# `${KERNEL_FILES}/bgmv_expand.cpp`, but KERNEL_FILES is a ;-list of absolute
++# paths, so that expands to every globbed kernel except the last plus one
++# nonexistent suffixed path: it removed pos_encoding_kernels.cpp and
++# get_masked_input_and_mask_kernel.cpp, which DO build for dav-m200, and kept a
++# LoRA kernel that does not.
++#
++# Why each entry is here:
++#   bgmv_*/sgmv_* - the device pass honours their
++#       `#if !defined(__CCE_AICORE__) || (__CCE_AICORE__ >= 220)` guard and
++#       emits no bf16 instantiation for m200, but the host stub pass compiles
++#       with __CCE_AICORE__ undefined, so the guard opens and the launch of
++#       e.g. bgmv_shrink_bfloat16_t fails as "not configured".
++#   batch_matmul_transpose - uses PIPE_FIX, a sync pipe that exists only on
++#       910/910B, and an Adds over __bf16 that the dav_m200 implementation
++#       static_asserts on.
++#   mla_preprocess - was NOT in this list, which is what breaks the 310P build.
++#       It is written against ArchType::ASCEND_V220 and instantiates
++#       MLAOperation over __bf16 unconditionally, so ccec rejects it with
++#       "unknown type name 'bfloat16_t'".
++#
++# csrc/soc_stubs/unsupported_310p.cpp below supplies the *_impl symbols that
++# csrc/torch_binding.cpp references for the ops these kernels back.
+ set(VLLM_ASCEND_CUSTOM_OP_EXCLUDE
+-    ${KERNEL_FILES}/bgmv_expand.cpp
+-    ${KERNEL_FILES}/bgmv_shrink.cpp
+-    ${KERNEL_FILES}/sgmv_expand.cpp
+-    ${KERNEL_FILES}/sgmv_shrink.cpp
++    ${CMAKE_CURRENT_SOURCE_DIR}/csrc/kernels/bgmv_expand.cpp
++    ${CMAKE_CURRENT_SOURCE_DIR}/csrc/kernels/bgmv_shrink.cpp
++    ${CMAKE_CURRENT_SOURCE_DIR}/csrc/kernels/sgmv_expand.cpp
++    ${CMAKE_CURRENT_SOURCE_DIR}/csrc/kernels/sgmv_shrink.cpp
++    ${CMAKE_CURRENT_SOURCE_DIR}/csrc/mla_preprocess/op_kernel/mla_preprocess_kernel.cpp
+     ${CMAKE_CURRENT_SOURCE_DIR}/csrc/batch_matmul_transpose/op_kernel/batch_matmul_transpose_kernel.cpp
+ )
+ 
+-if(SOC_VERSION STREQUAL "ASCEND310P3")
++if(SOC_IS_310P)
+     list(REMOVE_ITEM VLLM_ASCEND_CUSTOM_OP ${VLLM_ASCEND_CUSTOM_OP_EXCLUDE})
+ endif()
+ 
+@@ -79,15 +117,14 @@ ascendc_library(vllm_ascend_kernels SHARED
+ 
+ message("TORCH_NPU_PATH is ${TORCH_NPU_PATH}")
+ 
+-if(SOC_VERSION STREQUAL "ASCEND310P3")
+-    file(GLOB VLLM_ASCEND_SRC
+-    ${CMAKE_CURRENT_SOURCE_DIR}/csrc/*.cpp
+-    ${CMAKE_CURRENT_SOURCE_DIR}/csrc/aclnn_torch_adapter/*.cpp)
+-else()
+-    file(GLOB VLLM_ASCEND_SRC
+-    ${CMAKE_CURRENT_SOURCE_DIR}/csrc/*.cpp
+-    ${CMAKE_CURRENT_SOURCE_DIR}/csrc/aclnn_torch_adapter/*.cpp
+-    ${CMAKE_CURRENT_SOURCE_DIR}/csrc/batch_matmul_transpose/op_host/tiling/tiling_data.cpp)
++file(GLOB VLLM_ASCEND_SRC
++${CMAKE_CURRENT_SOURCE_DIR}/csrc/*.cpp
++${CMAKE_CURRENT_SOURCE_DIR}/csrc/aclnn_torch_adapter/*.cpp
++${CMAKE_CURRENT_SOURCE_DIR}/csrc/batch_matmul_transpose/op_host/tiling/tiling_data.cpp)
++
++if(SOC_IS_310P)
++    list(APPEND VLLM_ASCEND_SRC
++        ${CMAKE_CURRENT_SOURCE_DIR}/csrc/soc_stubs/unsupported_310p.cpp)
+ endif()
+ 
+ include_directories(
+diff --git a/csrc/soc_stubs/unsupported_310p.cpp b/csrc/soc_stubs/unsupported_310p.cpp
+new file mode 100644
+index 0000000..fb0a020
+--- /dev/null
++++ b/csrc/soc_stubs/unsupported_310p.cpp
+@@ -0,0 +1,81 @@
++/*
++ * Ascend 310P (AI Core arch dav-m200) stand-ins for kernels that only exist on
++ * the 910/910B AI Core (dav-c220).
++ *
++ * csrc/torch_binding.cpp defines and registers every custom op unconditionally,
++ * while the top-level CMakeLists drops the kernel sources that cannot be
++ * compiled for dav-m200. Without these definitions vllm_ascend_C.so carries
++ * undefined *_impl symbols and `import vllm_ascend.vllm_ascend_C` fails
++ * outright, taking every other op in the module with it.
++ *
++ * Defining them here keeps the module loadable and turns an unreachable call
++ * into a clear error. None of these ops are reachable on a 310P through
++ * vllm-ascend's own dispatch: LoRA falls back to vllm.lora.ops.torch_ops in
++ * vllm_ascend/lora/punica_npu.py, and mla_preprocess/batch_matmul_transpose
++ * belong to the DeepSeek MLA and sparse-attention paths, which are gated off
++ * for AscendDeviceType._310P.
++ *
++ * Deliberately does NOT include ../ops.h: that header carries a non-inline
++ * definition of weak_ref_tensor(), so including it in a second translation unit
++ * would be a duplicate symbol.
++ */
++
++#include <c10/util/Exception.h>
++#include <cstdint>
++
++#include "../kernels/types.h"
++
++namespace vllm_ascend {
++
++namespace {
++void unsupported_on_310p(const char *op)
++{
++    TORCH_CHECK(false, "vllm-ascend: '", op,
++                "' has no Ascend 310P (dav-m200) kernel - it is excluded at "
++                "build time because its Ascend C sources are dav-c220 only.");
++}
++}  // namespace
++
++void bgmv_shrink_impl(AscendType, void *, void *, void *, void *, uint32_t,
++                      void *, uint32_t, uint32_t, uint32_t, uint32_t, float)
++{
++    unsupported_on_310p("bgmv_shrink");
++}
++
++void bgmv_expand_impl(AscendType, void *, void *, void *, void *, uint32_t,
++                      void *, void *, uint32_t, uint32_t, uint32_t, uint32_t,
++                      uint32_t, uint32_t)
++{
++    unsupported_on_310p("bgmv_expand");
++}
++
++void sgmv_shrink_impl(AscendType, void *, void *, void *, void *, uint32_t,
++                      void *, uint32_t, void *, uint32_t, uint32_t, uint32_t,
++                      uint32_t, float)
++{
++    unsupported_on_310p("sgmv_shrink");
++}
++
++void sgmv_expand_impl(AscendType, void *, void *, void *, void *, uint32_t,
++                      void *, uint32_t, void *, void *, uint32_t, uint32_t,
++                      uint32_t, uint32_t, uint32_t, uint32_t)
++{
++    unsupported_on_310p("sgmv_expand");
++}
++
++void mla_preprocess_impl(void *, void *, void *, void *, void *, void *, void *,
++                         void *, void *, void *, void *, void *, void *, void *,
++                         void *, void *, void *, void *, void *, void *, void *,
++                         void *, void *, void *, void *, void *, void *, void *,
++                         void *, void *, void *, const uint32_t)
++{
++    unsupported_on_310p("mla_preprocess");
++}
++
++void batch_matmul_transpose_impl(void *, void *, void *, void *, void *,
++                                 const uint32_t)
++{
++    unsupported_on_310p("batch_matmul_transpose");
++}
++
++}  // namespace vllm_ascend
