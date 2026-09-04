@@ -24,6 +24,7 @@ Self-contained, reproducible Docker build environment for cross-compiling Huawei
 ├── download_deps.sh        # Idempotent downloader with SHA-256 integrity verification
 ├── verify.sh               # 15-point automated verification suite
 ├── .dockerignore           # Context exclusion to prevent image layer bloat
+├── .gitattributes          # Enforces LF endings across all platforms
 └── README.md
 
 ```
@@ -34,18 +35,17 @@ Self-contained, reproducible Docker build environment for cross-compiling Huawei
 
 1. **Docker with BuildKit support:** Docker 20.10+ (Docker Desktop or native Docker daemon inside WSL 2).
 2. **Build Utilities:** `bash`, `wget`, `curl`, `sha256sum`, `stat`.
-3. **WSL 2 Recommendation:** Always clone and run the repository inside the native Linux filesystem (e.g. `~/docker-cann-cross-compile-toolkit-aarch64`), **not** on Windows mounts (`/mnt/c/...`), to avoid disk I/O bottlenecks, line-ending corruption (`CRLF`), and file permission conflicts.
+3. **WSL 2 Recommendation:** Always clone and run the repository inside the native Linux filesystem (e.g. `~/docker-cann-cross-compile-toolkit-aarch64`), **not** on Windows mounts (`/mnt/c/...`), to avoid disk I/O bottlenecks and file permission conflicts.
 
 ---
 
 ## Step-by-Step Instructions
 
-### 1. Fix Line Endings and Permissions
+### 1. Make Scripts Executable
 
-If the repository was cloned or touched by Windows tools, normalize line endings to Unix format and grant execution permissions:
+Grant execution permissions to the build and verification scripts:
 
 ```bash
-sed -i 's/\r$//' download_deps.sh assemble_sysroot.sh verify.sh
 chmod +x download_deps.sh assemble_sysroot.sh verify.sh
 
 ```
@@ -171,5 +171,3 @@ cmake --build build -j$(nproc)
 * **Symlink Resolution:** `assemble_sysroot.sh` uses `find \( -type f -o -type l \)` with `cp -aL` to dereference and preserve all shared object aliases (e.g. `libascend_protobuf.so`).
 * **Driver Link-Time Stubs:** Cross-linking host binaries against `libascendcl.so` requires device driver link stubs (`drvHdc*`, `hal*`) located under `${CANN_AARCH64_ROOT}/devlib/linux/aarch64/`.
 * **C++ Standard:** Ascend C headers (`kernel_operator.h`) require `-std=c++17`. Compiling with default C++11 will fail.
-
-```
