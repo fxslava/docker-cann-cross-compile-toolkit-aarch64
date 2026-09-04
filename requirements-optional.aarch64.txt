@@ -1,0 +1,17 @@
+# ---------------------------------------------------------------------------
+# Best-effort wheelhouse extras. provision_deps_aarch64.sh downloads these one
+# at a time and only warns when one has no cp310 aarch64 wheel, because none of
+# them is needed for `import vllm_ascend` or for `vllm serve` on an Ascend
+# 310P3.
+#
+#   triton-ascend      upstream's own Dockerfile.310p uninstalls it right after
+#                      installing vllm-ascend, so it is deliberately not core
+#   memfabric_hybrid   kvpool memcache backend
+#   memcache_hybrid    kvpool memcache backend
+#   arctic-inference   speculative-decoding extra
+#   modelscope         alternative (non-HF) model download source
+# ---------------------------------------------------------------------------
+arctic-inference==0.1.1
+memfabric_hybrid==1.2.0
+memcache_hybrid==1.2.0
+modelscope<1.38

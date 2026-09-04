@@ -1,0 +1,22 @@
+# ---------------------------------------------------------------------------
+# pip constraints applied to EVERY resolve, both when the wheelhouse is
+# downloaded and when the image installs from it.
+#
+# WHY THIS FILE EXISTS
+# On aarch64 the torch wheels published on PyPI are CUDA builds (they target
+# GH200 / Jetson). vLLM's dependency `compressed-tensors==0.17.0` only asks for
+# `torch>=2.10.0`, so an unconstrained resolve happily jumps to torch 2.14.0
+# and drags in ~5 GB of nvidia-*-cu13 wheels -- cuDNN alone is 651 MB -- none of
+# which an Ascend NPU can use, and which would also shadow the CPU build that
+# torch_npu is compiled against.
+#
+# Pinning the local-version ("+cpu") builds from download.pytorch.org keeps the
+# resolve on the CPU wheels: torch-2.10.0+cpu declares zero nvidia
+# requirements, so the whole CUDA subtree disappears.
+#
+# These are constraints, not requirements: they cap what may be chosen, they do
+# not install anything on their own.
+# ---------------------------------------------------------------------------
+torch==2.10.0+cpu
+torchvision==0.25.0+cpu
+torchaudio==2.10.0+cpu

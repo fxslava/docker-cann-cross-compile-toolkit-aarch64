@@ -1,0 +1,9 @@
+# Offline build artefacts. Everything under deps/ is provisioned by
+# provision_deps_aarch64.sh / download_deps.sh and is far too large for git
+# (CANN toolkit ~1.1 GB, AArch64 wheelhouse several GB).
+deps/
+
+# Loose artefacts if download_deps.sh was pointed at the repo root.
+*.run
+*.whl
+*.tar

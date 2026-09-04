@@ -1,0 +1,227 @@
+# syntax=docker/dockerfile:1.7
+# ============================================================================
+#  Native AArch64 offline inference image for Huawei Ascend 310P3
+#
+#  Host   : x86_64 (WSL2 / Ubuntu 22.04) running the build under QEMU
+#  Image  : linux/arm64, Ubuntu 22.04, Python 3.10
+#  Target : Ascend 310P3 servers (AI Core arch dav-m200)
+#
+#  Contains CANN 8.5.0 (AArch64), PyTorch 2.10.0+cpu, torch_npu 2.10.0.post4,
+#  vLLM 0.27.1 (VLLM_TARGET_DEVICE=empty) and vllm-ascend built from source,
+#  so the image can be saved to a tar and run on an air-gapped Ascend host.
+#
+#  WHY EMULATION INSTEAD OF CROSS-COMPILATION
+#  The sibling ./Dockerfile cross-builds AArch64 artefacts from an x86_64 CANN
+#  toolkit. That works for Ascend C kernels and ACL applications, but it cannot
+#  build vllm-ascend: its CMakeLists runs `import torch` to check the version
+#  and its setup.py shells out to `pip show torch-npu` for the target headers,
+#  so build-host and target Python must be the same interpreter. Running the
+#  whole build as aarch64 also sidesteps the op_build dlopen mismatch, because
+#  op_build and the libraries it loads are then both AArch64.
+#
+#  EVERY STEP BELOW IS OFFLINE. The build takes no network at all:
+#    apt     -> deps/apt_debs (local file: repository)
+#    pip     -> deps/python_wheels (--no-index --find-links)
+#    CANN    -> deps/Ascend-cann-toolkit_8.5.0_linux-aarch64.run (bind mount)
+#    sources -> deps/src/vllm-ascend (bind mount, catlass submodule included)
+#  Populate all of that with ./provision_deps_aarch64.sh first.
+#
+#  Build:
+#    ./build_aarch64.sh
+#  or:
+#    docker buildx build --platform linux/arm64 --network=none \
+#        -f Dockerfile.aarch64 -t vllm-ascend-310p:aarch64-offline .
+# ============================================================================
+ARG BASE_IMAGE=ubuntu:22.04
+FROM --platform=linux/arm64 ${BASE_IMAGE}
+
+ARG DEBIAN_FRONTEND=noninteractive
+ARG CANN_VERSION=8.5.0
+ARG ASCEND_BASE=/usr/local/Ascend
+
+# SOC_VERSION IS DELIBERATELY LOWERCASE.
+# The chip is an Ascend 310P3 and CANN spells that "Ascend310P3", but
+# vllm-ascend gates on it twice with case-sensitive matches:
+#   * CMakeLists.txt   `if(SOC_VERSION MATCHES "ascend310p.*")` decides to SKIP
+#                      the ascendc_library kernel target (310P has no MLAPO /
+#                      batch_matmul_transpose support); "Ascend310P3" misses
+#                      that branch and tries to build kernels the SoC lacks.
+#   * build_aclnn.sh   `[[ "$SOC_VERSION" =~ ^ascend310 ]]` selects the four
+#                      310P custom ACLNN ops and SOC_ARG=ascend310p.
+# vllm_ascend/device/hardware.py lowercases before its own lookup, so
+# "ascend310p3" is accepted everywhere and resolves to device family _310P.
+ARG SOC_VERSION=ascend310p3
+ARG COMPILE_CUSTOM_KERNELS=1
+
+# setuptools-scm cannot see a tag in a shallow/exported checkout, so the wheel
+# version is pinned explicitly. Override to match the vllm-ascend ref you
+# provisioned.
+ARG VLLM_ASCEND_VERSION=0.27.0.dev0
+
+# ---------------------------------------------------------------------------
+# 1. Base packages, installed from the local arm64 apt archive
+# ---------------------------------------------------------------------------
+# deps/apt_debs carries the .deb closure of packages.aarch64.txt plus a
+# dpkg-scanpackages index, exposed as a `file:` repository so this is a normal
+# apt transaction with no network behind it.
+#
+# ldconfig segfaults intermittently under qemu-user while dpkg runs the
+# libc-bin trigger, which aborts the whole transaction. Stub it out for the
+# duration and restore the real binary afterwards.
+RUN --mount=type=bind,source=deps/apt_debs,target=/debs \
+    --mount=type=bind,source=packages.aarch64.txt,target=/tmp/packages.txt \
+    cp -aL /usr/sbin/ldconfig /usr/sbin/ldconfig.orig \
+    && printf '#!/bin/sh\nexit 0\n' > /usr/sbin/ldconfig \
+    && chmod 0755 /usr/sbin/ldconfig \
+    && mv /etc/apt/sources.list /etc/apt/sources.list.online \
+    && echo 'deb [trusted=yes] file:/debs ./' > /etc/apt/sources.list \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends \
+        $(grep -vE '^[[:space:]]*(#|$)' /tmp/packages.txt | tr '\n' ' ') \
+    && mv -f /etc/apt/sources.list.online /etc/apt/sources.list \
+    && rm -rf /var/lib/apt/lists/* \
+    && mv -f /usr/sbin/ldconfig.orig /usr/sbin/ldconfig \
+    && ldconfig \
+    && python3 --version
+
+# ---------------------------------------------------------------------------
+# 2. Python build backend, strictly offline
+# ---------------------------------------------------------------------------
+# jammy ships pip 22.0.2, which chokes on Metadata-Version 2.4 wheels, so the
+# very first thing installed from the wheelhouse is a newer pip.
+RUN --mount=type=bind,source=deps/python_wheels,target=/opt/wheels \
+    python3 -m pip install --no-cache-dir --no-index --find-links=/opt/wheels \
+        pip setuptools wheel setuptools-scm packaging \
+    && python3 -m pip --version
+
+# ---------------------------------------------------------------------------
+# 3. CANN 8.5.0 toolkit, AArch64, installed natively
+# ---------------------------------------------------------------------------
+# --full is `--install` plus the development/op-package payload; vllm-ascend's
+# ACLNN custom-op build needs the op tooling, so the narrower --install is not
+# enough. --install-for-all keeps the tree readable by the unprivileged
+# HwHiAiUser that the Ascend driver runs helpers as.
+#
+# The 1.1 GB .run is bind-mounted, never COPYed, so it costs no image layer.
+RUN --mount=type=bind,source=deps/Ascend-cann-toolkit_${CANN_VERSION}_linux-aarch64.run,target=/tmp/cann-aarch64.run \
+    bash /tmp/cann-aarch64.run --full --quiet --install-path=${ASCEND_BASE} --install-for-all \
+    && rm -rf /root/toolkit_tmp /root/var/log/ascend_seclog/* /root/log 2>/dev/null || true
+
+# ---------------------------------------------------------------------------
+# 4. Environment
+# ---------------------------------------------------------------------------
+# Mirrors ascend-toolkit/set_env.sh so that a plain `docker run <image> python3`
+# works without sourcing anything. /usr/local/Ascend/driver/lib64 is empty in
+# the image on purpose: it is where the host driver gets bind-mounted at run
+# time (see README.aarch64.md).
+#
+# The LAST entry, ${ASCEND_TOOLKIT_HOME}/devlib, is what makes `import
+# torch_npu` work with no NPU attached: torch_npu pulls in libascend_hal.so,
+# which normally ships with the host *driver*, and CANN keeps link-time stubs
+# in devlib for exactly this case. set_env.sh appends the same directory when
+# it cannot find a driver. It is last on the path on purpose, so a real driver
+# always wins on a real Ascend host.
+ENV ASCEND_TOOLKIT_HOME=/usr/local/Ascend/ascend-toolkit/latest
+ENV ASCEND_HOME_PATH=${ASCEND_TOOLKIT_HOME}
+ENV ASCEND_OPP_PATH=${ASCEND_TOOLKIT_HOME}/opp
+ENV ASCEND_AICPU_PATH=${ASCEND_TOOLKIT_HOME}
+ENV TOOLCHAIN_HOME=${ASCEND_TOOLKIT_HOME}/toolkit
+ENV PATH=${ASCEND_TOOLKIT_HOME}/bin:${ASCEND_TOOLKIT_HOME}/tools/ccec_compiler/bin:${ASCEND_TOOLKIT_HOME}/compiler/ccec_compiler/bin:${ASCEND_TOOLKIT_HOME}/tools/profiler/bin:${PATH}
+ENV LD_LIBRARY_PATH=/usr/local/Ascend/driver/lib64:/usr/local/Ascend/driver/lib64/common:/usr/local/Ascend/driver/lib64/driver:${ASCEND_TOOLKIT_HOME}/lib64:${ASCEND_TOOLKIT_HOME}/lib64/plugin/opskernel:${ASCEND_TOOLKIT_HOME}/lib64/plugin/nnengine:${ASCEND_TOOLKIT_HOME}/opp/built-in/op_impl/ai_core/tbe/op_tiling/lib/linux/aarch64:${ASCEND_TOOLKIT_HOME}/tools/aml/lib64:${ASCEND_TOOLKIT_HOME}/tools/aml/lib64/plugin:${ASCEND_TOOLKIT_HOME}/devlib
+ENV PYTHONPATH=${ASCEND_TOOLKIT_HOME}/python/site-packages:${ASCEND_TOOLKIT_HOME}/opp/built-in/op_impl/ai_core/tbe
+ENV CMAKE_PREFIX_PATH=${ASCEND_TOOLKIT_HOME}/lib64/cmake:${ASCEND_TOOLKIT_HOME}/toolkit/tools/tikicpulib/lib/cmake
+ENV SOC_VERSION=${SOC_VERSION}
+ENV ASCEND_AICORE_ARCH=dav-m200
+ENV COMPILE_CUSTOM_KERNELS=${COMPILE_CUSTOM_KERNELS}
+# Ascend runtime knobs upstream sets in its own images.
+ENV TASK_QUEUE_ENABLE=1
+ENV OMP_NUM_THREADS=1
+
+# From here on RUN uses bash, not dash: CANN's set_env.sh is a bash script and
+# the remaining stages source it.
+SHELL ["/bin/bash", "-c"]
+
+# ---------------------------------------------------------------------------
+# 5. PyTorch stack, vLLM and the vllm-ascend dependency set - all offline
+# ---------------------------------------------------------------------------
+# THREE separate pip transactions on purpose. vLLM's metadata declares
+# fastapi[standard]>=0.133.0 and vllm-ascend's requirements.txt declares
+# fastapi<0.124.0; those cannot be satisfied together, so a single resolve just
+# fails. Upstream's Dockerfile.310p hits the same conflict and lets the later
+# install win, which is what happens here too.
+RUN --mount=type=bind,source=deps/python_wheels,target=/opt/wheels \
+    --mount=type=bind,source=requirements.aarch64.txt,target=/tmp/requirements.aarch64.txt \
+    --mount=type=bind,source=constraints.aarch64.txt,target=/tmp/constraints.aarch64.txt \
+    --mount=type=bind,source=deps/src/vllm-ascend/requirements.txt,target=/tmp/vllm-ascend-requirements.txt \
+    set -eux \
+    && PIPI="python3 -m pip install --no-cache-dir --no-index --find-links=/opt/wheels -c /tmp/constraints.aarch64.txt" \
+    && $PIPI -r /tmp/requirements.aarch64.txt \
+    && $PIPI vllm \
+    && grep -vEi '^[[:space:]]*(triton[-_]ascend|memfabric[-_]hybrid|memcache[-_]hybrid|arctic-inference)([[:space:]]|=|<|>|$)' \
+         /tmp/vllm-ascend-requirements.txt > /tmp/va-req.txt \
+    && $PIPI -r /tmp/va-req.txt \
+    && python3 -c "import torch, vllm; print('torch', torch.__version__, 'vllm', vllm.__version__)"
+
+# ---------------------------------------------------------------------------
+# 6. Build and install vllm-ascend for Ascend 310P3
+# ---------------------------------------------------------------------------
+# The source is copied out of the read-only bind mount because setup.py writes
+# _version.py, _build_info.py, build/ and .deps/ back into the tree.
+#
+# --no-build-isolation is required, not merely faster: vllm-ascend's
+# pyproject.toml build-system lists triton-ascend==3.2.2, which is published
+# only on Huawei's mirror and which upstream uninstalls again immediately after
+# building. An isolated build env would try to fetch it and there is no network.
+# Everything the build actually needs (setuptools-scm, cmake>=3.26, pybind11,
+# torch, torch_npu) is already installed by stage 5.
+#
+# --no-deps for the same reason: install_requires is generated from
+# requirements.txt including those unpublished extras. Stage 5 already
+# installed the filtered dependency set.
+RUN --mount=type=bind,source=deps/python_wheels,target=/opt/wheels \
+    --mount=type=bind,source=deps/src/vllm-ascend,target=/src/vllm-ascend \
+    set -eux \
+    && cp -a /src/vllm-ascend /tmp/vllm-ascend \
+    && cd /tmp/vllm-ascend \
+    && export SETUPTOOLS_SCM_PRETEND_VERSION="${VLLM_ASCEND_VERSION}" \
+    && export SETUPTOOLS_SCM_PRETEND_VERSION_FOR_VLLM_ASCEND="${VLLM_ASCEND_VERSION}" \
+    && export CMAKE_BUILD_TYPE=Release \
+    && . ${ASCEND_BASE}/ascend-toolkit/set_env.sh \
+    && python3 setup.py bdist_wheel -d /tmp/va-dist \
+    && python3 -m pip install --no-cache-dir --no-index --find-links=/opt/wheels \
+        --no-deps /tmp/va-dist/*.whl \
+    && cd / && rm -rf /tmp/vllm-ascend /tmp/va-dist /root/.cache
+
+# ---------------------------------------------------------------------------
+# 7. Ascend driver plumbing expected on the target host
+# ---------------------------------------------------------------------------
+# The driver's helper daemons run as these accounts and write to these paths;
+# the uid/gid values match a stock Ascend host install, so bind-mounted device
+# nodes keep working. /lib64 -> /lib because driver binaries are linked against
+# /lib64/ld-linux-aarch64.so.1, which Ubuntu arm64 does not create.
+RUN mkdir -m 750 -p /var/driver /var/dmp /usr/slog /home/drv/hdc_ppc /var/log/npu/slog \
+    && mkdir -m 755 -p /usr/local/Ascend/driver/lib64 \
+    && { [ -e /lib64 ] || ln -sf /lib /lib64; } \
+    && groupadd -g 1000 HwHiAiUser && useradd -u 1000 -g HwHiAiUser -d /home/HwHiAiUser -m HwHiAiUser \
+    && groupadd -g 1101 HwDmUser   && useradd -u 1101 -g HwDmUser   -d /home/HwDmUser   -m HwDmUser \
+    && groupadd -g 1102 HwBaseUser && useradd -u 1102 -g HwBaseUser -d /home/HwBaseUser -m HwBaseUser \
+    && groupadd -g 1100 HwSysUser  && useradd -u 1100 -g HwSysUser  -d /home/HwSysUser  -m HwSysUser \
+    && usermod -a -G HwBaseUser HwHiAiUser \
+    && usermod -a -G HwDmUser   HwHiAiUser \
+    && chown HwDmUser:HwDmUser     /var/dmp \
+    && chown HwHiAiUser:HwHiAiUser /var/driver /usr/slog /home/drv/hdc_ppc /var/log/npu/slog \
+    && ldconfig
+
+# ---------------------------------------------------------------------------
+# 8. Entrypoint and verification
+# ---------------------------------------------------------------------------
+COPY entrypoint.sh     /usr/local/bin/entrypoint.sh
+COPY verify_runtime.sh /usr/local/bin/verify-runtime.sh
+RUN chmod +x /usr/local/bin/entrypoint.sh /usr/local/bin/verify-runtime.sh
+
+# Fail the build, not the deployment, if the offline install did not take.
+RUN python3 -c "import torch; import torch_npu; import vllm; import vllm_ascend; print('ALL RUNTIME IMPORTS SUCCEEDED')"
+
+WORKDIR /workspace
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
+CMD ["serve"]

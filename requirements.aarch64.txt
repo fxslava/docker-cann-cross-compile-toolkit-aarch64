@@ -1,0 +1,40 @@
+# ---------------------------------------------------------------------------
+# Extra pins layered on top of deps/src/vllm-ascend/requirements.txt when the
+# AArch64 wheelhouse (deps/python_wheels/) is populated.
+#
+# Everything here must resolve to a cp310 / manylinux aarch64 wheel, because
+# the offline image installs with `pip install --no-index`.
+# ---------------------------------------------------------------------------
+
+# Build backend. setuptools is capped below 81 because vllm's own metadata
+# declares setuptools<81.0.0 and a newer one makes the two installs disagree.
+pip
+setuptools>=77.0.3,<81.0.0
+setuptools-scm>=8
+wheel
+packaging
+
+# jammy ships cmake 3.22.1; vllm-ascend's CMakeLists/pyproject need >= 3.26.
+cmake>=3.26
+ninja
+pybind11
+
+# Torch stack.
+#   torch is pinned to the local-version build (torch-2.10.0+cpu-...aarch64.whl)
+#   that download_deps.sh fetches from download.pytorch.org. PEP 440 orders
+#   2.10.0+cpu above plain 2.10.0, so pip prefers the local file over PyPI once
+#   deps/python_wheels is on --find-links.
+torch==2.10.0+cpu
+torch-npu==2.10.0.post4
+
+# Imported by CANN's TBE/op tooling and by vllm-ascend's setup.py.
+attrs
+decorator
+sympy
+cffi
+psutil
+pyyaml
+requests
+protobuf
+absl-py
+googleapis-common-protos

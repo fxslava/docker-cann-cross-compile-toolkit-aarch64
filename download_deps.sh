@@ -6,6 +6,12 @@
 #
 #   ./download_deps.sh [dest-dir]        (default: ~/cann-build)
 #
+# Set DEPS_ONLY to an extended regex to fetch a subset. The AArch64 offline
+# inference image (Dockerfile.aarch64) needs neither the x86_64 toolkit nor the
+# cross sysroot, so provision_deps_aarch64.sh calls this as:
+#
+#   DEPS_ONLY='aarch64|^torch-' ./download_deps.sh ./deps
+#
 # ---------------------------------------------------------------------------
 # VERSION STRING GOTCHA -- READ BEFORE CHANGING CANN_VERSION
 #
@@ -31,12 +37,17 @@ set -euo pipefail
 DEST="${1:-$HOME/cann-build}"
 CANN_VERSION="${CANN_VERSION:-8.5.0}"
 TORCH_VERSION="${TORCH_VERSION:-2.10.0}"
+# Extended regex matched against the file name; empty means "everything".
+DEPS_ONLY="${DEPS_ONLY:-}"
 
 CANN_BASE="https://ascend-repo.obs.cn-east-2.myhuaweicloud.com/CANN/CANN%20${CANN_VERSION}"
 TORCH_BASE="https://download.pytorch.org/whl/cpu"
 
 mkdir -p "$DEST"
 cd "$DEST"
+# Re-anchor to an absolute path: everything below runs from inside $DEST, so a
+# relative dest ("./deps") would no longer resolve by the closing `ls`.
+DEST="$PWD"
 
 # name | url | sha256 | size-in-bytes
 # Hashes and sizes below were computed from the actual downloads on
@@ -71,6 +82,10 @@ for entry in "${DEPS[@]}"; do
     name="${entry%%|*}"; rest="${entry#*|}"
     url="${rest%%|*}";   rest="${rest#*|}"
     sha="${rest%%|*}";   size="${rest##*|}"
+
+    if [ -n "$DEPS_ONLY" ] && ! printf '%s' "$name" | grep -Eq "$DEPS_ONLY"; then
+        continue
+    fi
 
     echo "=== ${name}"
     if verify "$name" "$sha" "$size" 2>/dev/null; then
