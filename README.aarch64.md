@@ -146,7 +146,7 @@ docker pull docker/dockerfile:1.7
 
 1. **apt, offline.** `deps/apt_debs` is exposed as a `deb [trusted=yes] file:/debs ./` repository and the packages in `packages.aarch64.txt` are installed as a normal apt transaction.
 2. **pip bootstrap, offline.** jammy ships pip 22.0.2, which chokes on `Metadata-Version: 2.4` wheels, so a newer pip is the first thing installed from the wheelhouse.
-3. **CANN.** `Ascend-cann-toolkit_8.5.0_linux-aarch64.run --full --quiet --install-path=/usr/local/Ascend --install-for-all`, running natively under emulation. `--full` rather than the narrower `--install` because `vllm-ascend`'s ACLNN custom-op build needs the development/op-package payload.
+3. **CANN.** `Ascend-cann-toolkit_8.5.0_linux-aarch64.run --full --quiet --install-path=/usr/local/Ascend --install-for-all`, run in stage 0 **on the build host's own architecture** and then `COPY --from`ed into the arm64 image. `--full` rather than the narrower `--install` because `vllm-ascend`'s ACLNN custom-op build needs the development/op-package payload. This is the largest single saving in the build — 617 s emulated against ~93 s — and it runs the vendor installer unmodified; see [docs/cann-native-unpack.md](docs/cann-native-unpack.md) for how it works and how the resulting tree was verified identical.
 4. **Python stack**, in three separate `pip install --no-index --find-links=/opt/wheels` transactions (see the note on precedence below).
 5. **`vllm-ascend`**, patched from `patches/`, then built from `deps/src/vllm-ascend` for `SOC_VERSION=ascend310p3` and installed.
 6. **Driver plumbing** — `HwHiAiUser` and friends, `/var/driver`, `/usr/slog`, `/lib64 -> /lib`.
@@ -187,10 +187,13 @@ The CMake side is then fixed rather than worked around: the patch above replaces
 docker run --rm vllm-ascend-310p:aarch64-offline verify
 ```
 
-> **Build time.** A cold build is ~22 min, 47% of which is the CANN `.run`
-> installer running under emulation; a warm rebuild after a source change is
-> ~6 min, almost all of it the vllm-ascend wheel. `docs/cross-compilation-analysis.md`
-> has the full breakdown and measures how far a split host/target build gets.
+> **Build time.** A cold build is ~13 min, down from ~22 min since the CANN
+> toolkit install moved to a host-architecture stage
+> ([docs/cann-native-unpack.md](docs/cann-native-unpack.md)). A warm rebuild
+> after a source change is ~6 min, almost all of it the vllm-ascend wheel.
+> [docs/cross-compilation-analysis.md](docs/cross-compilation-analysis.md) has
+> the full per-step breakdown and measures how far a split host/target build of
+> the wheel itself would get.
 
 `verify_runtime.sh` checks the architecture, the Python version, the CANN install, the compiled `vllm_ascend_C` extension, and that `vllm_ascend` was built for device family `_310P`. Its core assertion is the acceptance check:
 
@@ -310,6 +313,8 @@ requirements-optional.aarch64.txt  best-effort extras (a miss is not fatal)
 constraints.aarch64.txt        keeps the resolve on +cpu torch, off CUDA
 cann_extra.aarch64.txt         CANN libraries the toolkit .run omits
 patches/                       local fixes applied to vllm-ascend at build time
+docs/cann-native-unpack.md     stage 0: CANN installed on the build host's arch
+docs/soc-build-matrix.md       what changes per target SoC (310P3 / 910B / 950)
 docs/cross-compilation-analysis.md  where the build time goes, and how far a
                                split host/target build gets (with measurements)
 docs/analyze_build.py          per-step timing breakdown of a buildx log

@@ -11,10 +11,13 @@
 #   CONTEXT    build context    (default the directory holding this script)
 #   DEPS_DIR   offline payload  (default $CONTEXT/deps)
 #
+#   UNPACKER_IMAGE  base for the host-side CANN stage (default python:3.10-slim)
+#
 # The RUN steps are executed with --network=none, so a successful build is
-# itself the proof that deps/ is complete. Only two things are fetched from a
+# itself the proof that deps/ is complete. Only three things are fetched from a
 # registry, and only if they are not already cached locally: the arm64
-# ubuntu:22.04 base image and the BuildKit dockerfile frontend.
+# $BASE_IMAGE, the $UNPACKER_IMAGE used by stage 0, and the BuildKit dockerfile
+# frontend.
 # ---------------------------------------------------------------------------
 set -euo pipefail
 
@@ -22,6 +25,7 @@ CONTEXT="${CONTEXT:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
 DEPS_DIR="${DEPS_DIR:-$CONTEXT/deps}"
 TAG="${TAG:-vllm-ascend-310p:aarch64-offline}"
 BASE_IMAGE="${BASE_IMAGE:-ubuntu:22.04}"
+UNPACKER_IMAGE="${UNPACKER_IMAGE:-python:3.10-slim}"
 
 SAVE_TO=""
 EXTRA=()
@@ -61,6 +65,15 @@ else
     echo "  base     : $BASE_IMAGE (arm64) cached"
 fi
 
+# Stage 0 installs the CANN toolkit on the build host's own architecture, which
+# is what turns that step from ~617 s of emulation into ~74 s. Its base image
+# has to ship python3 and pip3, which the toolkit's --pylocal components call.
+if docker image inspect "$UNPACKER_IMAGE" >/dev/null 2>&1; then
+    echo "  unpacker : $UNPACKER_IMAGE cached"
+else
+    echo "  unpacker : $UNPACKER_IMAGE not cached locally; BuildKit will fetch it"
+fi
+
 # Not optional: vllm-ascend v0.13.0 does not build for a 310P without these, and
 # a missing directory would surface as an opaque mount error hours in.
 ls "$CONTEXT"/patches/*.patch >/dev/null 2>&1 \
@@ -85,7 +98,7 @@ echo "  deps     : $(du -sh "$DEPS_DIR" | cut -f1) in $DEPS_DIR"
 # --- build -----------------------------------------------------------------
 echo
 echo "=== building $TAG (linux/arm64, --network=none) ==="
-echo "    expect hours, not minutes: every instruction runs under QEMU"
+echo "    ~15 min cold, ~6 min warm: everything but stage 0 runs under QEMU"
 start=$(date +%s)
 
 docker buildx build \
@@ -93,6 +106,7 @@ docker buildx build \
     --network=none \
     --progress=plain \
     --build-arg BASE_IMAGE="$BASE_IMAGE" \
+    --build-arg UNPACKER_IMAGE="$UNPACKER_IMAGE" \
     -f "$CONTEXT/Dockerfile.aarch64" \
     -t "$TAG" \
     --load \

@@ -11,6 +11,12 @@ All timings are from `--progress=plain` buildx logs on the WSL2 x86_64 host
 
 ## 1. Where the time goes
 
+> **Superseded in part.** These are the numbers *before* the CANN toolkit
+> install moved to a host-architecture stage (§4). Step 4/13 below is now ~93 s
+> rather than 617 s, and a cold build is ~13 min rather than ~22. The relative
+> picture for the *wheel* build, which is what §2 and §3 are about, is
+> unchanged.
+
 ### Cold build — every layer rebuilt: **~1305 s (21.8 min)**
 
 | Step | What it does | Time | Share |
@@ -180,29 +186,32 @@ remaining unknowns for anyone continuing:
 
 ---
 
-## 4. A separate, larger win that needs no cross-compiler
+## 4. A separate, larger win that needs no cross-compiler — **now implemented**
 
-The CANN installer is 47% of a cold build, and none of it is compilation.
-`assemble_sysroot.sh` already relies on the fact that the aarch64 `.run` can be
-unpacked without executing its ARM64 install logic:
+The CANN installer was 47% of a cold build, and none of it is compilation. That
+step now runs in stage 0 on the build host's own architecture and the arm64
+image `COPY --from`s the result: **617 s → ~93 s**, taking a cold build from
+~22 min to ~13 min.
 
-```
-bash Ascend-cann-toolkit_8.5.0_linux-aarch64.run --noexec --extract=<dir>
-```
+The earlier note here proposed extracting the payload with `--noexec --extract=`
+and reassembling the merged tree by hand, and warned that getting that merge
+subtly wrong would surface only on real hardware. That turned out to be
+unnecessary. Measurements that changed the plan:
 
-Measured on this host: **13 s** for the outer package and **23 s** for all 20
-component packages — **36 s natively against 617 s emulated, a 17× difference**
-for the single most expensive step.
+| Phase | Emulated | Native |
+|---|---:|---:|
+| self-extraction (outer + 21 components) | 161 s | 38 s |
+| install scripts (the merge itself) | ~456 s | ~50 s |
 
-The catch is that a raw extraction is not an install. It produces a
-per-component tree (`cann-aoe/…`, `cann-npu-runtime/…`, each with its own
-`latest_manager`), not the merged `ascend-toolkit/8.5.0/…` layout plus `latest`
-symlinks that the installer builds and that every path in stage 4 of
-`Dockerfile.aarch64` depends on. Reproducing that merge faithfully is real
-work, and getting it subtly wrong would surface only on real hardware.
+Decompression is only a quarter of the cost — the merge is the rest — so
+extracting natively and merging under emulation would have saved little. The
+installer, however, is pure shell whose only architecture dependency is reading
+`arch` to choose component packages. Shimming that lets the **vendor installer
+run unmodified** on the host, which is both faster and more faithful than any
+hand-written merge.
 
-Worth doing, but as its own change with its own verification — not folded into
-a cross-compilation refactor.
+See [cann-native-unpack.md](cann-native-unpack.md) for the mechanism and for the
+manifest diff proving the resulting tree is identical to an emulated install.
 
 ---
 

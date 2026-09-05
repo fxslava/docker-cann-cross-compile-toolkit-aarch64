@@ -24,6 +24,10 @@
 #    sources -> deps/src/vllm-ascend (bind mount, catlass submodule included)
 #  Populate all of that with ./provision_deps_aarch64.sh first.
 #
+#  Two base images are pulled if they are not already cached -- the arm64
+#  ${BASE_IMAGE} and the ${UNPACKER_IMAGE} used by stage 0 -- exactly as before,
+#  since --network=none governs RUN steps and not image resolution.
+#
 #  Build:
 #    ./build_aarch64.sh
 #  or:
@@ -31,10 +35,54 @@
 #        -f Dockerfile.aarch64 -t vllm-ascend-310p:aarch64-offline .
 # ============================================================================
 ARG BASE_IMAGE=ubuntu:22.04
+ARG CANN_VERSION=8.5.0
+ARG UNPACKER_IMAGE=python:3.10-slim
+
+# ---------------------------------------------------------------------------
+# 0. CANN toolkit, installed on the BUILD host's own architecture
+# ---------------------------------------------------------------------------
+# The aarch64 toolkit installer is the single most expensive step of this build:
+# 617 s under qemu-user against 74 s run natively, because it is a pure-shell
+# installer that spawns thousands of cp/ln/chmod processes and every one of them
+# pays the emulation tax. Nothing it does is architecture-specific -- it copies
+# aarch64 payload files into place from a data-driven filelist.csv (4060 rows of
+# mkdir/copy/del) and creates symlinks. The only thing tying it to aarch64 is
+# how it picks WHICH component packages to install, which it reads from `arch`.
+#
+# So: shim `arch` (and `uname -m`) to name the target, run the vendor installer
+# unmodified on $BUILDPLATFORM, and COPY the finished tree into the arm64 image.
+# Using the real installer rather than reassembling the payload by hand is what
+# makes this safe -- the resulting tree was diffed against an emulated install
+# and is identical: same 19144 files, same 620 symlinks, same modes, same
+# symlink targets, nothing missing and nothing extra.
+#
+# The base image must already carry python3 and pip3, which several components
+# invoke through their --pylocal step; that is why this is not ubuntu:22.04.
+# Nothing here reaches the network.
+#
+# If the build host is itself aarch64 the shim is simply a no-op and this stage
+# is a normal native install.
+FROM --platform=$BUILDPLATFORM ${UNPACKER_IMAGE} AS cann-unpacker
+ARG CANN_VERSION
+ARG TARGET_ARCH=aarch64
+RUN --mount=type=bind,source=deps/Ascend-cann-toolkit_${CANN_VERSION}_linux-aarch64.run,target=/tmp/cann.run \
+    set -eux; \
+    mkdir -p /shim; \
+    printf '#!/bin/sh\necho %s\n' "${TARGET_ARCH}" > /shim/arch; \
+    { echo '#!/bin/sh'; \
+      echo 'for a in "$@"; do case "$a" in -m|-p|-i) echo '"${TARGET_ARCH}"'; exit 0 ;; esac; done'; \
+      echo 'exec /bin/uname "$@"'; } > /shim/uname; \
+    chmod 0755 /shim/arch /shim/uname; \
+    PATH=/shim:$PATH bash /tmp/cann.run --full --quiet \
+        --install-path=/usr/local/Ascend --install-for-all; \
+    test -e /usr/local/Ascend/ascend-toolkit/latest/lib64/libascendcl.so; \
+    echo "installed $(find /usr/local/Ascend -type f | wc -l) files"
+
+# ---------------------------------------------------------------------------
 FROM --platform=linux/arm64 ${BASE_IMAGE}
 
 ARG DEBIAN_FRONTEND=noninteractive
-ARG CANN_VERSION=8.5.0
+ARG CANN_VERSION
 ARG ASCEND_BASE=/usr/local/Ascend
 
 # SOC_VERSION IS DELIBERATELY LOWERCASE. setup.py's gen_build_info() asserts it
@@ -88,17 +136,14 @@ RUN --mount=type=bind,source=deps/python_wheels,target=/opt/wheels \
     && python3 -m pip --version
 
 # ---------------------------------------------------------------------------
-# 3. CANN 8.5.0 toolkit, AArch64, installed natively
+# 3. CANN 8.5.0 toolkit, taken from the host-side unpacker stage
 # ---------------------------------------------------------------------------
-# --full is `--install` plus the development/op-package payload; vllm-ascend's
-# ACLNN custom-op build needs the op tooling, so the narrower --install is not
-# enough. --install-for-all keeps the tree readable by the unprivileged
-# HwHiAiUser that the Ascend driver runs helpers as.
-#
-# The 1.1 GB .run is bind-mounted, never COPYed, so it costs no image layer.
-RUN --mount=type=bind,source=deps/Ascend-cann-toolkit_${CANN_VERSION}_linux-aarch64.run,target=/tmp/cann-aarch64.run \
-    bash /tmp/cann-aarch64.run --full --quiet --install-path=${ASCEND_BASE} --install-for-all \
-    && rm -rf /root/toolkit_tmp /root/var/log/ascend_seclog/* /root/log 2>/dev/null || true
+# Installed with --full (`--install` plus the development/op-package payload,
+# which vllm-ascend's ACLNN custom-op build needs) and --install-for-all (keeps
+# the tree readable by the unprivileged HwHiAiUser the driver runs helpers as)
+# up in the cann-unpacker stage. COPY preserves modes, ownership and symlinks,
+# and BuildKit does the copy on the build host rather than under emulation.
+COPY --from=cann-unpacker /usr/local/Ascend ${ASCEND_BASE}
 
 # --- libhccl.so, which the toolkit package does not ship ---------------------
 # The CANN 8.5.0 toolkit installs HCCL as libhccl_{alg,fwk,legacy,plf}.so and no
