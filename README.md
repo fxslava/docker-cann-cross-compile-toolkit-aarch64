@@ -19,15 +19,25 @@ Self-contained, reproducible Docker build environment for cross-compiling Huawei
 
 ```text
 .
-├── Dockerfile              # Multi-stage / BuildKit image recipe
-├── assemble_sysroot.sh     # Extracts 170+ target AArch64 CANN libraries & driver stubs
-├── download_deps.sh        # Idempotent downloader with SHA-256 integrity verification
-├── verify.sh               # 15-point automated verification suite
-├── .dockerignore           # Context exclusion to prevent image layer bloat
-├── .gitattributes          # Enforces LF endings across all platforms
+├── docker/
+│   ├── builder-x86_64/          # THIS image: the cross-compilation toolchain
+│   │   ├── Dockerfile           # Multi-stage / BuildKit image recipe
+│   │   ├── assemble_sysroot.sh  # Extracts 170+ target AArch64 CANN libraries & driver stubs
+│   │   └── verify.sh            # 15-point automated verification suite
+│   └── target-310p/             # sibling image: native AArch64 inference (README.aarch64.md)
+├── deps/                        # offline payload: CANN .run files, wheels, debs (git-ignored)
+├── artifacts/                   # exported image tarballs (git-ignored)
+├── download_deps.sh             # Idempotent downloader with SHA-256 integrity verification
+├── .dockerignore                # Context exclusion to prevent image layer bloat
+├── .gitattributes               # Enforces LF endings across all platforms
 └── README.md
 
 ```
+
+The build context for **both** images is the repository root, and every path
+inside the two Dockerfiles is repo-relative. Always build with `-f`, never by
+`cd`-ing into a Dockerfile's own directory — that would leave the `deps/`
+payload outside the context.
 
 ---
 
@@ -46,7 +56,7 @@ Self-contained, reproducible Docker build environment for cross-compiling Huawei
 Grant execution permissions to the build and verification scripts:
 
 ```bash
-chmod +x download_deps.sh assemble_sysroot.sh verify.sh
+chmod +x download_deps.sh docker/builder-x86_64/*.sh
 
 ```
 
@@ -54,10 +64,10 @@ chmod +x download_deps.sh assemble_sysroot.sh verify.sh
 
 ### 2. Download Dependencies
 
-Run the dependency downloader. The script verifies existing files via SHA-256 and fetches any missing artifacts into the current build context:
+Run the dependency downloader. The script verifies existing files via SHA-256 and fetches any missing artifacts into `deps/`, the payload directory both images read from:
 
 ```bash
-./download_deps.sh .
+./download_deps.sh deps
 
 ```
 
@@ -71,11 +81,12 @@ This step pulls:
 
 ### 3. Build the Docker Image
 
-The `Dockerfile` uses BuildKit bind-mounts (`--mount=type=bind`) so large installer packages are never copied into the image layers.
+`docker/builder-x86_64/Dockerfile` uses BuildKit bind-mounts (`--mount=type=bind`) so large installer packages are never copied into the image layers.
 
 * **Standard Build (Host cross-compiler + Ascend C kernel compiler):**
 ```bash
-DOCKER_BUILDKIT=1 docker build -t cann85-cross-310p:latest .
+DOCKER_BUILDKIT=1 docker build -f docker/builder-x86_64/Dockerfile \
+  -t cann85-cross-310p:latest .
 
 ```
 
@@ -83,6 +94,7 @@ DOCKER_BUILDKIT=1 docker build -t cann85-cross-310p:latest .
 * **Build with AArch64 LibTorch baked in (Recommended for `vllm-ascend` wheel builds):**
 ```bash
 DOCKER_BUILDKIT=1 docker build \
+  -f docker/builder-x86_64/Dockerfile \
   --build-arg WITH_LIBTORCH=1 \
   -t cann85-cross-310p:latest .
 
@@ -167,7 +179,7 @@ cmake --build build -j$(nproc)
 ## Technical Notes & Gotchas
 
 * **CANN Version String:** Upstream Huawei OBS returns HTTP `403 Forbidden` on nonexistent keys. Use version `8.5.0` (not `8.5.RC1`).
-* **Makeself Extraction:** Inner packages fail if extraction target directories already exist. `assemble_sysroot.sh` manages scratch directories dynamically.
+* **Makeself Extraction:** Inner packages fail if extraction target directories already exist. `docker/builder-x86_64/assemble_sysroot.sh` manages scratch directories dynamically.
 * **Symlink Resolution:** `assemble_sysroot.sh` uses `find \( -type f -o -type l \)` with `cp -aL` to dereference and preserve all shared object aliases (e.g. `libascend_protobuf.so`).
 * **Driver Link-Time Stubs:** Cross-linking host binaries against `libascendcl.so` requires device driver link stubs (`drvHdc*`, `hal*`) located under `${CANN_AARCH64_ROOT}/devlib/linux/aarch64/`.
 * **C++ Standard:** Ascend C headers (`kernel_operator.h`) require `-std=c++17`. Compiling with default C++11 will fail.

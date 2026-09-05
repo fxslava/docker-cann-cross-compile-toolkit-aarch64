@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ---------------------------------------------------------------------------
-# Populate ./deps/ so that Dockerfile.aarch64 can be built with
-# `--network=none`. This is the ONLY step that touches the network.
+# Populate ./deps/ so that docker/target-310p/Dockerfile.aarch64 can be built
+# with `--network=none`. This is the ONLY step that touches the network.
 #
 #   ./provision_deps_aarch64.sh [deps-dir]      (default: <repo>/deps)
 #
@@ -32,6 +32,7 @@ set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DEPS="${1:-${DEPS_DIR:-$REPO_DIR/deps}}"
+TARGET_DIR="${TARGET_DIR:-$REPO_DIR/docker/target-310p}"
 
 CANN_VERSION="${CANN_VERSION:-8.5.0}"
 ARM_BASE="${ARM_BASE:-arm64v8/ubuntu:22.04}"
@@ -60,12 +61,12 @@ mkdir -p "$DEPS" "$WHEELS" "$DEBS" "$SRC" "$PROV"
 
 # Staged once, up front: every in-container step below bind-mounts $PROV as
 # /prov and reads these.
-cp -f "$REPO_DIR/packages.aarch64.txt"             "$PROV/packages.txt"
-cp -f "$REPO_DIR/requirements.aarch64.txt"         "$PROV/requirements.aarch64.txt"
-cp -f "$REPO_DIR/requirements-optional.aarch64.txt" "$PROV/requirements-optional.aarch64.txt"
-cp -f "$REPO_DIR/constraints.aarch64.txt"          "$PROV/constraints.aarch64.txt"
+cp -f "$TARGET_DIR/packages.aarch64.txt"             "$PROV/packages.txt"
+cp -f "$TARGET_DIR/requirements.aarch64.txt"         "$PROV/requirements.aarch64.txt"
+cp -f "$TARGET_DIR/requirements-optional.aarch64.txt" "$PROV/requirements-optional.aarch64.txt"
+cp -f "$TARGET_DIR/constraints.aarch64.txt"          "$PROV/constraints.aarch64.txt"
 for s in fetch_debs fetch_wheels build_vllm_wheel; do
-    cp -f "$REPO_DIR/scripts/$s.sh" "$PROV/$s.sh"
+    cp -f "$TARGET_DIR/scripts/$s.sh" "$PROV/$s.sh"
 done
 
 # ---------------------------------------------------------------------------
@@ -132,7 +133,7 @@ CANN_IMAGE="${CANN_IMAGE:-quay.io/ascend/cann:${CANN_VERSION}-310p-ubuntu22.04-p
 CANN_EXTRA_LIB64="/usr/local/Ascend/cann-${CANN_VERSION}/aarch64-linux/lib64"
 mkdir -p "$CANN_EXTRA"
 
-want=$(grep -vE '^[[:space:]]*(#|$)' "$REPO_DIR/cann_extra.aarch64.txt")
+want=$(grep -vE '^[[:space:]]*(#|$)' "$TARGET_DIR/cann_extra.aarch64.txt")
 missing=""
 for lib in $want; do
     [ -f "$CANN_EXTRA/$lib" ] || missing="$missing $lib"

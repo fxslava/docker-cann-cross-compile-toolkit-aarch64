@@ -4,7 +4,7 @@ Where the emulated build actually spends its time, how far a split
 host/target build gets today, and what is left to close it.
 
 All timings are from `--progress=plain` buildx logs on the WSL2 x86_64 host
-(12 cores), building `Dockerfile.aarch64` under `qemu-aarch64`. Reproduce with
+(12 cores), building `docker/target-310p/Dockerfile.aarch64` under `qemu-aarch64`. Reproduce with
 `docs/analyze_build.py <build.log>`.
 
 ---
@@ -62,7 +62,7 @@ So a host/target split is worth roughly **16% off a cold build** but plausibly
 
 ## 2. What was proven to work
 
-Experiments run in `cann85-cross-310p:latest` (the sibling `./Dockerfile`
+Experiments run in `cann85-cross-310p:latest` (the sibling `docker/builder-x86_64/Dockerfile`
 image: `aarch64-linux-gnu` GCC 11 + the x86_64 CANN 8.5.0 toolkit + the
 aarch64 CANN sysroot from `assemble_sysroot.sh`).
 

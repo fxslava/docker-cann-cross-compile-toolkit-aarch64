@@ -45,7 +45,7 @@ grep -nE '^set\((ascend|kirin)[a-z0-9_]*_list' \
 | Runtime dtype | must be `--dtype float16` |
 
 The 310P is inference-only silicon and its AI Core has no bf16 path, which is
-what `patches/0001-…-ascend310p-kernel-gates.patch` exists to handle: the
+what `docker/target-310p/patches/0001-…-ascend310p-kernel-gates.patch` exists to handle: the
 Ascend C kernels that instantiate over `__bf16`, and the ones using `PIPE_FIX`
 (a 910/910B-only synchronisation pipe), cannot be compiled and are excluded,
 with a stub translation unit supplying their `*_impl` symbols so the module
@@ -63,7 +63,7 @@ still links. See the patch header for the per-kernel reasoning.
 
 What has to change:
 
-* **`ARG SOC_VERSION`** in `Dockerfile.aarch64`, and **`ENV ASCEND_AICORE_ARCH`**
+* **`ARG SOC_VERSION`** in `docker/target-310p/Dockerfile.aarch64`, and **`ENV ASCEND_AICORE_ARCH`**
   from `dav-m200` to `dav-c220`.
 * **`verify_runtime.sh`** asserts `__device_type__ = _310P`; that check has to
   become target-aware or it will fail the build for a correct 910B image.
@@ -116,7 +116,7 @@ that this CANN does not yet build for.
 | `SOC_VERSION` | `Dockerfile.aarch64` `ARG` | `ascend310p3` | `ascend910b1`… |
 | `ASCEND_AICORE_ARCH` | `Dockerfile.aarch64` `ENV` | `dav-m200` | `dav-c220` |
 | device-family assert | `verify_runtime.sh` step 4 | `_310P` | `A2` |
-| kernel-exclusion patch | `patches/0001-…` | active | inert (gate does not match) |
+| kernel-exclusion patch | `docker/target-310p/patches/0001-…` | active | inert (gate does not match) |
 | `cann_extra` source image | `provision_deps_aarch64.sh` step 1b | `…:8.5.0-310p-…` | needs the 910b tag |
 | serving dtype | runtime `--dtype` | `float16` (forced) | bf16 or fp16 |
 

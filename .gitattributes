@@ -1,6 +1,16 @@
 * text=auto
 *.sh text eol=lf
+*.py text eol=lf
 Dockerfile text eol=lf
 Dockerfile.* text eol=lf
 .dockerignore text eol=lf
 *.patch text eol=lf
+
+# The rules above carry no slash, so git already applies them at any depth.
+# Spelled out for the partitioned build tree so that moving an asset between
+# docker/target-310p/ and docker/builder-x86_64/ cannot quietly drop the LF
+# guarantee that these files are executed with inside Linux containers.
+docker/**/Dockerfile*  text eol=lf
+docker/**/*.sh         text eol=lf
+docker/**/*.patch      text eol=lf
+docker/**/*.txt        text eol=lf

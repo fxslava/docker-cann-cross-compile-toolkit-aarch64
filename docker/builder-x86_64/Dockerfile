@@ -9,16 +9,16 @@
 #    * host side   - aarch64-linux-gnu GCC toolchain + CANN aarch64 sysroot
 #    * device side - CANN Bisheng/ccec compiler for Ascend C kernels
 #
-#  Build context must contain (see download_deps.sh):
-#    Ascend-cann-toolkit_8.5.0_linux-x86_64.run
-#    Ascend-cann-toolkit_8.5.0_linux-aarch64.run
-#    torch-2.10.0+cpu-cp310-cp310-manylinux_2_28_aarch64.whl   (optional)
+#  Build context is the REPOSITORY ROOT; deps/ must contain (see download_deps.sh):
+#    deps/Ascend-cann-toolkit_8.5.0_linux-x86_64.run
+#    deps/Ascend-cann-toolkit_8.5.0_linux-aarch64.run
+#    deps/torch-2.10.0+cpu-cp310-cp310-manylinux_2_28_aarch64.whl   (optional)
 #
 #  The .run files are bind-mounted at build time, so ~2.2 GB of installer
 #  never lands in an image layer.
 #
-#  Build:
-#    DOCKER_BUILDKIT=1 docker build -t cann85-cross-310p:latest .
+#  Build, from the repository root:
+#    DOCKER_BUILDKIT=1 docker build -f docker/builder-x86_64/Dockerfile -t cann85-cross-310p:latest .
 # ============================================================================
 FROM ubuntu:22.04
 
@@ -90,7 +90,7 @@ RUN python3 -m pip install --no-cache-dir --upgrade pip setuptools wheel \
 # ---------------------------------------------------------------------------
 # 3. CANN toolkit, x86_64 host side (ccec/Bisheng, ATC, TBE, op compilers)
 # ---------------------------------------------------------------------------
-RUN --mount=type=bind,source=Ascend-cann-toolkit_${CANN_VERSION}_linux-x86_64.run,target=/tmp/cann-x86_64.run \
+RUN --mount=type=bind,source=deps/Ascend-cann-toolkit_${CANN_VERSION}_linux-x86_64.run,target=/tmp/cann-x86_64.run \
     bash /tmp/cann-x86_64.run --full --quiet --install-path=${ASCEND_BASE} --install-for-all \
     && rm -rf /root/toolkit_tmp /root/var/log/ascend_seclog/* /root/log 2>/dev/null || true
 
@@ -130,8 +130,8 @@ ENV ASCEND_CROSS_SYSROOT=${ASCEND_TOOLKIT_HOME}/aarch64-linux
 # The aarch64 .run cannot run its installer on x86_64, so the payload is
 # extracted and re-laid-out. Afterwards the aarch64 devlib shipped inside the
 # x86_64 package fills anything still missing.
-COPY assemble_sysroot.sh /usr/local/bin/assemble_sysroot.sh
-RUN --mount=type=bind,source=Ascend-cann-toolkit_${CANN_VERSION}_linux-aarch64.run,target=/tmp/cann-aarch64.run \
+COPY docker/builder-x86_64/assemble_sysroot.sh /usr/local/bin/assemble_sysroot.sh
+RUN --mount=type=bind,source=deps/Ascend-cann-toolkit_${CANN_VERSION}_linux-aarch64.run,target=/tmp/cann-aarch64.run \
     chmod +x /usr/local/bin/assemble_sysroot.sh \
     && /usr/local/bin/assemble_sysroot.sh /tmp/cann-aarch64.run "${CANN_AARCH64_ROOT}" \
     && cp -an "${ASCEND_TOOLKIT_HOME}/x86_64-linux/devlib/aarch64/." \
@@ -147,7 +147,7 @@ RUN --mount=type=bind,source=Ascend-cann-toolkit_${CANN_VERSION}_linux-aarch64.r
 ENV LIBTORCH_AARCH64_ROOT=/opt/libtorch-aarch64
 RUN --mount=type=bind,target=/ctx \
     if [ "${WITH_LIBTORCH}" = "1" ]; then \
-        whl=$(ls /ctx/torch-*-cp310-cp310-manylinux_2_28_aarch64.whl 2>/dev/null | head -1); \
+        whl=$(ls /ctx/deps/torch-*-cp310-cp310-manylinux_2_28_aarch64.whl 2>/dev/null | head -1); \
         if [ -n "$whl" ]; then \
             mkdir -p /tmp/lt && unzip -q "$whl" 'torch/lib/*' 'torch/include/*' -d /tmp/lt && \
             mkdir -p "${LIBTORCH_AARCH64_ROOT}" && \
@@ -161,7 +161,7 @@ RUN --mount=type=bind,target=/ctx \
         echo "libtorch not requested (WITH_LIBTORCH=0)"; \
     fi
 
-COPY verify.sh /usr/local/bin/verify-cann-cross.sh
+COPY docker/builder-x86_64/verify.sh /usr/local/bin/verify-cann-cross.sh
 RUN chmod +x /usr/local/bin/verify-cann-cross.sh
 
 WORKDIR /work

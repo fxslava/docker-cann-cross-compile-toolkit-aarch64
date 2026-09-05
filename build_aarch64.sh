@@ -3,13 +3,14 @@
 # Build the native AArch64 Ascend 310P3 inference image under QEMU emulation.
 #
 #   ./build_aarch64.sh                       build and load into the local daemon
-#   ./build_aarch64.sh --save image.tar      build, then export for air-gapped copy
+#   ./build_aarch64.sh --save out.tar.gz     build, then export for air-gapped copy
 #   ./build_aarch64.sh --no-cache            anything unrecognised goes to buildx
 #
 # Environment:
 #   TAG        image tag        (default vllm-ascend-310p:aarch64-offline)
 #   CONTEXT    build context    (default the directory holding this script)
 #   DEPS_DIR   offline payload  (default $CONTEXT/deps)
+#   TARGET_DIR image assets     (default $CONTEXT/docker/target-310p)
 #
 #   UNPACKER_IMAGE  base for the host-side CANN stage (default python:3.10-slim)
 #
@@ -23,6 +24,7 @@ set -euo pipefail
 
 CONTEXT="${CONTEXT:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
 DEPS_DIR="${DEPS_DIR:-$CONTEXT/deps}"
+TARGET_DIR="${TARGET_DIR:-$CONTEXT/docker/target-310p}"
 TAG="${TAG:-vllm-ascend-310p:aarch64-offline}"
 BASE_IMAGE="${BASE_IMAGE:-ubuntu:22.04}"
 UNPACKER_IMAGE="${UNPACKER_IMAGE:-python:3.10-slim}"
@@ -57,7 +59,7 @@ echo "  buildx   : linux/arm64 available"
 # still reach a registry to fetch it; on a genuinely air-gapped builder, cache
 # it first. Note that `docker pull --platform linux/arm64 ubuntu:22.04` REPLACES
 # the local ubuntu:22.04 tag with the arm64 image, which would break the x86_64
-# ./Dockerfile - so pre-pull arm64v8/ubuntu:22.04 and pass it through instead:
+# builder image - so pre-pull arm64v8/ubuntu:22.04 and pass it through instead:
 #   BASE_IMAGE=arm64v8/ubuntu:22.04 ./build_aarch64.sh
 if ! docker image inspect "$BASE_IMAGE" --format '{{.Architecture}}' 2>/dev/null | grep -q arm64; then
     echo "  base     : $BASE_IMAGE (arm64) not cached locally; BuildKit will fetch it"
@@ -76,9 +78,9 @@ fi
 
 # Not optional: vllm-ascend v0.13.0 does not build for a 310P without these, and
 # a missing directory would surface as an opaque mount error hours in.
-ls "$CONTEXT"/patches/*.patch >/dev/null 2>&1 \
-    || die "no $CONTEXT/patches/*.patch; the 310P build needs them (see README.aarch64.md)"
-echo "  patches  : $(ls "$CONTEXT"/patches/*.patch | wc -l) for vllm-ascend"
+ls "$TARGET_DIR"/patches/*.patch >/dev/null 2>&1 \
+    || die "no $TARGET_DIR/patches/*.patch; the 310P build needs them (see README.aarch64.md)"
+echo "  patches  : $(ls "$TARGET_DIR"/patches/*.patch | wc -l) for vllm-ascend"
 
 missing=()
 [ -f "$DEPS_DIR"/Ascend-cann-toolkit_*_linux-aarch64.run ] 2>/dev/null || missing+=("CANN aarch64 .run")
@@ -98,7 +100,7 @@ echo "  deps     : $(du -sh "$DEPS_DIR" | cut -f1) in $DEPS_DIR"
 # --- build -----------------------------------------------------------------
 echo
 echo "=== building $TAG (linux/arm64, --network=none) ==="
-echo "    ~15 min cold, ~6 min warm: everything but stage 0 runs under QEMU"
+echo "    ~12.5 min cold, ~6 min warm: everything but stage 0 runs under QEMU"
 start=$(date +%s)
 
 docker buildx build \
@@ -107,7 +109,7 @@ docker buildx build \
     --progress=plain \
     --build-arg BASE_IMAGE="$BASE_IMAGE" \
     --build-arg UNPACKER_IMAGE="$UNPACKER_IMAGE" \
-    -f "$CONTEXT/Dockerfile.aarch64" \
+    -f "$TARGET_DIR/Dockerfile.aarch64" \
     -t "$TAG" \
     --load \
     "${EXTRA[@]}" \
@@ -121,7 +123,20 @@ docker image ls "$TAG"
 if [ -n "$SAVE_TO" ]; then
     echo
     echo "=== saving $TAG -> $SAVE_TO ==="
-    docker save "$TAG" -o "$SAVE_TO"
-    echo "  $(du -h "$SAVE_TO" | cut -f1)  $SAVE_TO"
+    mkdir -p "$(dirname "$SAVE_TO")"
+    case "$SAVE_TO" in
+        # A .gz destination streams through pigz instead of landing an 8 GB
+        # tar on disk first. docker load reads gzip natively, so the archive
+        # needs no separate decompression step on the target host.
+        *.gz)
+            command -v pigz >/dev/null || die "pigz not on PATH (apt-get install pigz)"
+            docker save "$TAG" | pigz -p "$(nproc)" > "$SAVE_TO"
+            ;;
+        *)
+            docker save "$TAG" -o "$SAVE_TO"
+            ;;
+    esac
+    echo "  $(stat -c %s "$SAVE_TO") bytes  ($(du -h "$SAVE_TO" | cut -f1))  $SAVE_TO"
+    echo "  sha256: $(sha256sum "$SAVE_TO" | cut -d" " -f1)"
     echo "  copy to the target host, then: docker load -i $(basename "$SAVE_TO")"
 fi

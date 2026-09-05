@@ -28,11 +28,16 @@
 #  ${BASE_IMAGE} and the ${UNPACKER_IMAGE} used by stage 0 -- exactly as before,
 #  since --network=none governs RUN steps and not image resolution.
 #
+#  THE BUILD CONTEXT IS THE REPOSITORY ROOT, not this directory. deps/ is the
+#  offline payload and lives there, so every path below is repo-relative:
+#  deps/... for the payload, docker/target-310p/... for this image's own files.
+#
 #  Build:
 #    ./build_aarch64.sh
-#  or:
+#  or, from the repository root:
 #    docker buildx build --platform linux/arm64 --network=none \
-#        -f Dockerfile.aarch64 -t vllm-ascend-310p:aarch64-offline .
+#        -f docker/target-310p/Dockerfile.aarch64 \
+#        -t vllm-ascend-310p:aarch64-offline .
 # ============================================================================
 ARG BASE_IMAGE=ubuntu:22.04
 ARG CANN_VERSION=8.5.0
@@ -110,7 +115,7 @@ ARG VLLM_ASCEND_VERSION=0.13.0
 # libc-bin trigger, which aborts the whole transaction. Stub it out for the
 # duration and restore the real binary afterwards.
 RUN --mount=type=bind,source=deps/apt_debs,target=/debs \
-    --mount=type=bind,source=packages.aarch64.txt,target=/tmp/packages.txt \
+    --mount=type=bind,source=docker/target-310p/packages.aarch64.txt,target=/tmp/packages.txt \
     cp -aL /usr/sbin/ldconfig /usr/sbin/ldconfig.orig \
     && printf '#!/bin/sh\nexit 0\n' > /usr/sbin/ldconfig \
     && chmod 0755 /usr/sbin/ldconfig \
@@ -217,8 +222,8 @@ SHELL ["/bin/bash", "-c"]
 # wants fastapi>=0.133.0 against vllm-ascend's <0.124.0), and then a single
 # joint resolve fails outright rather than picking a side.
 RUN --mount=type=bind,source=deps/python_wheels,target=/opt/wheels \
-    --mount=type=bind,source=requirements.aarch64.txt,target=/tmp/requirements.aarch64.txt \
-    --mount=type=bind,source=constraints.aarch64.txt,target=/tmp/constraints.aarch64.txt \
+    --mount=type=bind,source=docker/target-310p/requirements.aarch64.txt,target=/tmp/requirements.aarch64.txt \
+    --mount=type=bind,source=docker/target-310p/constraints.aarch64.txt,target=/tmp/constraints.aarch64.txt \
     --mount=type=bind,source=deps/src/vllm-ascend/requirements.txt,target=/tmp/vllm-ascend-requirements.txt \
     set -eux \
     && PIPI="python3 -m pip install --no-cache-dir --no-index --find-links=/opt/wheels -c /tmp/constraints.aarch64.txt" \
@@ -256,7 +261,7 @@ RUN --mount=type=bind,source=deps/python_wheels,target=/opt/wheels \
 RUN --mount=type=bind,source=deps/python_wheels,target=/opt/wheels \
     --mount=type=bind,source=deps/third_party,target=/third_party \
     --mount=type=bind,source=deps/src/vllm-ascend,target=/src/vllm-ascend \
-    --mount=type=bind,source=patches,target=/patches \
+    --mount=type=bind,source=docker/target-310p/patches,target=/patches \
     set -eux \
     && cp -a /src/vllm-ascend /tmp/vllm-ascend \
     && cd /tmp/vllm-ascend \
@@ -309,8 +314,8 @@ RUN mkdir -m 750 -p /var/driver /var/dmp /usr/slog /home/drv/hdc_ppc /var/log/np
 # ---------------------------------------------------------------------------
 # 8. Entrypoint and verification
 # ---------------------------------------------------------------------------
-COPY entrypoint.sh     /usr/local/bin/entrypoint.sh
-COPY verify_runtime.sh /usr/local/bin/verify-runtime.sh
+COPY docker/target-310p/entrypoint.sh     /usr/local/bin/entrypoint.sh
+COPY docker/target-310p/verify_runtime.sh /usr/local/bin/verify-runtime.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh /usr/local/bin/verify-runtime.sh
 
 # Fail the build, not the deployment, if the offline install did not take.

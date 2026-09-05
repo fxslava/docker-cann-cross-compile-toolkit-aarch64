@@ -1,6 +1,6 @@
 # Installing the AArch64 CANN toolkit on the build host
 
-Stage 0 of `Dockerfile.aarch64` installs the aarch64 CANN toolkit on the build
+Stage 0 of `docker/target-310p/Dockerfile.aarch64` installs the aarch64 CANN toolkit on the build
 host's own architecture and the arm64 stage `COPY --from`s the finished tree.
 This is the single largest build-time saving in the repo. Here is why it is
 safe, and how it was verified.

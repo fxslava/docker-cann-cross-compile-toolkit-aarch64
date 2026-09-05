@@ -1,30 +1,22 @@
 *
 
-# --- Dockerfile (x86_64 cross-compilation image) ---
-!Ascend-cann-toolkit_*_linux-x86_64.run
-!Ascend-cann-toolkit_*_linux-aarch64.run
-!torch-*-cp310-cp310-manylinux_2_28_aarch64.whl
-!assemble_sysroot.sh
-!verify.sh
+# The build context for BOTH images is the repository root, so everything the
+# Dockerfiles read is repo-relative and only two trees are re-included here:
+# deps/ (the offline payload) and docker/ (the image assets).
 
-# --- Dockerfile.aarch64 (native AArch64 offline inference image) ---
-# deps/ carries the whole offline payload: the CANN .run, the AArch64
-# wheelhouse, the local apt archive and the vllm-ascend source. It is
-# bind-mounted at build time, never COPYed, so it costs no image layer.
+# --- offline payload: bind-mounted, never COPYed ---------------------------
+# deps/ carries the CANN .run, the AArch64 wheelhouse, the local apt archive
+# and the vllm-ascend source. It is mounted at build time, never copied, so it
+# costs no image layer.
 !deps
-# ...but not the parts Dockerfile.aarch64 never reads. The vLLM source is only
-# needed while provisioning builds its wheel, and .provision is scratch space.
+# ...but not the parts no Dockerfile reads. The vLLM source is only needed
+# while provisioning builds its wheel, and .provision is scratch space.
 deps/src/vllm
 deps/.provision
 
-# Bind-mounted by Dockerfile.aarch64, so they must stay in the context.
-!packages.aarch64.txt
-!requirements.aarch64.txt
-!constraints.aarch64.txt
-
-# Local fixes applied to deps/src/vllm-ascend at build time.
-!patches
-
-# COPYed into the image.
-!entrypoint.sh
-!verify_runtime.sh
+# --- image assets ----------------------------------------------------------
+# docker/target-310p/     Dockerfile.aarch64 plus the package lists, patches,
+#                         entrypoint and verification script it mounts or COPYs
+# docker/builder-x86_64/  the cross-compilation Dockerfile plus the sysroot
+#                         assembly and verification scripts it COPYs
+!docker

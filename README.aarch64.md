@@ -4,7 +4,7 @@ A `linux/arm64` Docker image built **on an x86_64 host under QEMU emulation**, c
 
 This is the sibling of the cross-compilation image documented in [README.md](README.md). They solve different problems:
 
-| | `Dockerfile` (x86_64) | `Dockerfile.aarch64` (this document) |
+| | `docker/builder-x86_64/Dockerfile` | `docker/target-310p/Dockerfile.aarch64` (this document) |
 |---|---|---|
 | Image architecture | `linux/amd64` | `linux/arm64` (QEMU-emulated at build time) |
 | Purpose | cross-compile Ascend C kernels and ACL apps | run inference on the target |
@@ -88,7 +88,7 @@ This is the only step that touches the network. It fills `./deps/` with everythi
 | Path | Contents |
 |---|---|
 | `deps/Ascend-cann-toolkit_8.5.0_linux-aarch64.run` | CANN toolkit, AArch64 (~1.1 GB, SHA-256 verified) |
-| `deps/apt_debs/` | arm64 `.deb` closure of `packages.aarch64.txt` + `dpkg-scanpackages` index |
+| `deps/apt_debs/` | arm64 `.deb` closure of `docker/target-310p/packages.aarch64.txt` + `dpkg-scanpackages` index |
 | `deps/python_wheels/` | cp310 / manylinux-aarch64 wheelhouse (torch 2.8.0+cpu, torch_npu, the vLLM wheel and every transitive dependency) |
 | `deps/src/vllm-ascend/` | `vllm-ascend` checkout **including the `catlass` submodule** |
 | `deps/MANIFEST.txt` | inventory of the above |
@@ -129,7 +129,7 @@ which wraps:
 docker buildx build \
     --platform linux/arm64 \
     --network=none \
-    -f Dockerfile.aarch64 \
+    -f docker/target-310p/Dockerfile.aarch64 \
     -t vllm-ascend-310p:aarch64-offline \
     --load \
     .
@@ -148,13 +148,13 @@ docker pull docker/dockerfile:1.7
 2. **pip bootstrap, offline.** jammy ships pip 22.0.2, which chokes on `Metadata-Version: 2.4` wheels, so a newer pip is the first thing installed from the wheelhouse.
 3. **CANN.** `Ascend-cann-toolkit_8.5.0_linux-aarch64.run --full --quiet --install-path=/usr/local/Ascend --install-for-all`, run in stage 0 **on the build host's own architecture** and then `COPY --from`ed into the arm64 image. `--full` rather than the narrower `--install` because `vllm-ascend`'s ACLNN custom-op build needs the development/op-package payload. This is the largest single saving in the build — 617 s emulated against ~93 s — and it runs the vendor installer unmodified; see [docs/cann-native-unpack.md](docs/cann-native-unpack.md) for how it works and how the resulting tree was verified identical.
 4. **Python stack**, in three separate `pip install --no-index --find-links=/opt/wheels` transactions (see the note on precedence below).
-5. **`vllm-ascend`**, patched from `patches/`, then built from `deps/src/vllm-ascend` for `SOC_VERSION=ascend310p3` and installed.
+5. **`vllm-ascend`**, patched from `docker/target-310p/patches/`, then built from `deps/src/vllm-ascend` for `SOC_VERSION=ascend310p3` and installed.
 6. **Driver plumbing** — `HwHiAiUser` and friends, `/var/driver`, `/usr/slog`, `/lib64 -> /lib`.
 7. **A build-time import check.** The image cannot be produced unless `import torch, torch_npu, vllm, vllm_ascend` all succeed.
 
 ### `vllm-ascend` needs patching to build for a 310P at all
 
-`deps/src/vllm-ascend` stays a pristine upstream checkout. The local changes live in `patches/` and are applied to the *copy* in stage 6, so re-provisioning never has to undo anything and bumping `VLLM_ASCEND_REF` only means rebasing the diff. Each patch carries its rationale in a header above the diff; `patches/0001-vllm-ascend-0.13.0-ascend310p-kernel-gates.patch` is the one that makes v0.13.0 build:
+`deps/src/vllm-ascend` stays a pristine upstream checkout. The local changes live in `docker/target-310p/patches/` and are applied to the *copy* in stage 6, so re-provisioning never has to undo anything and bumping `VLLM_ASCEND_REF` only means rebasing the diff. Each patch carries its rationale in a header above the diff; `docker/target-310p/patches/0001-vllm-ascend-0.13.0-ascend310p-kernel-gates.patch` is the one that makes v0.13.0 build:
 
 * **The SoC gates never fire.** `CMakeLists.txt` reads `if(SOC_VERSION STREQUAL "ASCEND310P3")` while `setup.py` accepts only the lowercase spelling (see below), so 910B-only kernels reach `ccec` and the build dies on `PIPE_FIX`, a sync pipe that exists only on 910/910B. The patch folds the case into a `SOC_IS_310P` flag matching the whole family.
 * **`mla_preprocess` is missing from the exclusion list.** It is `ArchType::ASCEND_V220` code instantiating `MLAOperation` over `__bf16`, which the 310P AI Core does not have, so `ccec` rejects it with `unknown type name 'bfloat16_t'`. MLA is a DeepSeek path that does not run on a 310P regardless. The four LoRA entries in that list are also respelled: written as `${KERNEL_FILES}/bgmv_expand.cpp` against a `;`-list of absolute paths, they expanded to the wrong set — dropping `pos_encoding_kernels.cpp` and `get_masked_input_and_mask_kernel.cpp`, which *do* build here, and keeping a LoRA kernel, which does not.
@@ -184,11 +184,16 @@ The CMake side is then fixed rather than worked around: the patch above replaces
 ## 5. Verify
 
 ```bash
-docker run --rm vllm-ascend-310p:aarch64-offline verify
+docker run --rm --platform linux/arm64 --network=none \
+    vllm-ascend-310p:aarch64-offline verify
 ```
 
-> **Build time.** A cold build is ~13 min, down from ~22 min since the CANN
-> toolkit install moved to a host-architecture stage
+On a build host with no NPU that is **9 checks, all passing** — the two
+hardware-only checks report as `[INFO]` (see below).
+
+> **Build time.** A cold build is ~12.5 min (745 s measured end to end from a
+> fully evicted BuildKit cache), down from ~22 min since the CANN toolkit
+> install moved to a host-architecture stage
 > ([docs/cann-native-unpack.md](docs/cann-native-unpack.md)). A warm rebuild
 > after a source change is ~6 min, almost all of it the vllm-ascend wheel.
 > [docs/cross-compilation-analysis.md](docs/cross-compilation-analysis.md) has
@@ -218,24 +223,29 @@ That is CANN's own generated stub, not anything specific to this image — which
 ## 6. Export for air-gapped deployment
 
 ```bash
-./build_aarch64.sh --save vllm-ascend-310p-aarch64.tar
+./build_aarch64.sh --save artifacts/vllm-ascend-310p-aarch64-offline.tar.gz
 ```
 
-or by hand:
+or by hand, streaming straight into `pigz` so the uncompressed 8 GB tar never
+touches the disk:
 
 ```bash
-docker save vllm-ascend-310p:aarch64-offline -o vllm-ascend-310p-aarch64.tar
-gzip -1 vllm-ascend-310p-aarch64.tar          # optional, roughly halves it
+docker save vllm-ascend-310p:aarch64-offline \
+    | pigz -p "$(nproc)" > artifacts/vllm-ascend-310p-aarch64-offline.tar.gz
+sha256sum artifacts/vllm-ascend-310p-aarch64-offline.tar.gz
 ```
 
-Copy the tar to the target server and load it:
+The 8.03 GB image compresses to 1.99 GB. Copy the archive to the target server
+and load it:
 
 ```bash
-docker load -i vllm-ascend-310p-aarch64.tar
+docker load -i artifacts/vllm-ascend-310p-aarch64-offline.tar.gz
 docker image ls vllm-ascend-310p
 ```
 
-The tar is self-contained: the target host needs a Docker daemon and the Ascend **driver** (which is a host package, never shipped in an image), nothing else.
+`docker load` reads gzip natively, so there is no separate decompression step.
+
+The archive is self-contained: the target host needs a Docker daemon and the Ascend **driver** (which is a host package, never shipped in an image), nothing else.
 
 ---
 
@@ -300,29 +310,49 @@ Each default is only applied when you have not passed the corresponding flag you
 
 ## 8. Repository layout
 
+Build assets are partitioned by target; the orchestrators, the payload and the
+docs stay at the root because both images share them.
+
 ```text
-Dockerfile.aarch64             native AArch64 offline inference image
 build_aarch64.sh               preflight + buildx wrapper + docker save
 provision_deps_aarch64.sh      fills deps/ (the only networked step)
-scripts/fetch_debs.sh          arm64 .deb closure + apt index   (runs in-container)
-scripts/fetch_wheels.sh        aarch64 wheelhouse               (runs in-container)
-scripts/build_vllm_wheel.sh    vLLM wheel, VLLM_TARGET_DEVICE=empty (in-container)
-packages.aarch64.txt           apt package list, shared by provisioning and build
-requirements.aarch64.txt       torch stack + build backend pins
-requirements-optional.aarch64.txt  best-effort extras (a miss is not fatal)
-constraints.aarch64.txt        keeps the resolve on +cpu torch, off CUDA
-cann_extra.aarch64.txt         CANN libraries the toolkit .run omits
-patches/                       local fixes applied to vllm-ascend at build time
+download_deps.sh               shared installer downloader, SHA-256 verified
+
+docker/target-310p/            THIS image
+  Dockerfile.aarch64           native AArch64 offline inference image
+  entrypoint.sh                NPU detection + vllm serve launcher
+  verify_runtime.sh            in-image verification suite
+  packages.aarch64.txt         apt package list, shared by provisioning and build
+  requirements.aarch64.txt     torch stack + build backend pins
+  requirements-optional.aarch64.txt  best-effort extras (a miss is not fatal)
+  constraints.aarch64.txt      keeps the resolve on +cpu torch, off CUDA
+  cann_extra.aarch64.txt       CANN libraries the toolkit .run omits
+  patches/                     local fixes applied to vllm-ascend at build time
+  scripts/fetch_debs.sh        arm64 .deb closure + apt index   (runs in-container)
+  scripts/fetch_wheels.sh      aarch64 wheelhouse               (runs in-container)
+  scripts/build_vllm_wheel.sh  vLLM wheel, VLLM_TARGET_DEVICE=empty (in-container)
+
+docker/builder-x86_64/         sibling cross-compilation image, see README.md
+  Dockerfile                   x86_64 host toolchain + aarch64 CANN sysroot
+  assemble_sysroot.sh          lays out the aarch64 sysroot from the .run payload
+  verify.sh                    15-point cross-toolchain verification suite
+
 docs/cann-native-unpack.md     stage 0: CANN installed on the build host's arch
 docs/soc-build-matrix.md       what changes per target SoC (310P3 / 910B / 950)
 docs/cross-compilation-analysis.md  where the build time goes, and how far a
                                split host/target build gets (with measurements)
 docs/analyze_build.py          per-step timing breakdown of a buildx log
-artifacts/                     exported image tarballs (git-ignored)
-entrypoint.sh                  NPU detection + vllm serve launcher
-verify_runtime.sh              in-image verification suite
+
 deps/                          provisioned payload (git-ignored)
+artifacts/                     exported image tarballs (git-ignored)
 ```
+
+**The build context is the repository root, not `docker/target-310p/`.** The
+offline payload lives in `deps/`, so every mount and `COPY` in
+`Dockerfile.aarch64` is repo-relative: `deps/...` for the payload,
+`docker/target-310p/...` for the image's own files. `build_aarch64.sh` passes
+`-f docker/target-310p/Dockerfile.aarch64` with the root as context; override
+either half with `TARGET_DIR=` or `CONTEXT=`.
 
 ---
 
