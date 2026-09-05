@@ -1,0 +1,119 @@
+# ---------------------------------------------------------------------------
+# Sample project manifest: every image this repository can build, and the
+# release matrix each one is pinned to.
+#
+# This file is descriptive, not executable - nothing reads it yet. It exists so
+# the per-target facts scattered across the Dockerfiles, the build scripts and
+# docs/soc-build-matrix.md have one place to be compared side by side. Keep it
+# in step with those files; they are the source of truth.
+#
+#   cp ascend-project.sample.yaml ascend-project.yaml   # then edit locally
+# ---------------------------------------------------------------------------
+version: 1
+project: docker-cann-cross-compile-toolkit
+
+defaults:
+  # Both images are built from the repository ROOT, never from inside their own
+  # directory: deps/ is the offline payload and has to be inside the context.
+  context: .
+  network: none          # --network=none governs RUN steps; image pulls still resolve
+  export:
+    format: tar.gz       # docker save | pigz; docker load reads gzip natively
+    directory: artifacts
+
+targets:
+
+  # -------------------------------------------------------------------------
+  310p3-aarch64:
+    status: built and verified
+    description: >-
+      Native AArch64 offline inference image for Ascend 310P3, built on an
+      x86_64 host under QEMU emulation.
+    dockerfile: docker/target-310p/Dockerfile.aarch64
+    build_script: build_aarch64.sh
+    platform: linux/arm64
+    emulated: true                     # qemu-aarch64 via binfmt_misc
+    base_image: arm64v8/ubuntu:22.04
+    python: "3.10"
+    deps_dir: deps
+    soc:
+      soc_version: ascend310p3         # lowercase: setup.py asserts it
+      aicore_arch: dav-m200
+      device_family: _310P
+      dtype: float16                   # no bfloat16 in this AI Core
+    stack:
+      cann: 8.5.0
+      vllm: 0.13.0
+      vllm_ascend: 0.13.0
+      torch: 2.8.0+cpu
+      torch_npu: 2.8.0.post2
+    patches:
+      - docker/target-310p/patches/0001-vllm-ascend-0.13.0-ascend310p-kernel-gates.patch
+    verify:
+      script: docker/target-310p/verify_runtime.sh
+      assertions_on_build_host: 9
+    artifact: artifacts/vllm-ascend-310p-aarch64-offline.tar.gz
+
+  # -------------------------------------------------------------------------
+  950pr-x86_64:
+    status: scaffolded, not yet built    # payload not staged; see the doc
+    description: >-
+      Native x86_64 offline inference image for Ascend 950PR (Atlas 350),
+      DaVinci v3 / A5 device family. Host and target architecture are the same,
+      so there is no emulation and no unpacker stage.
+    dockerfile: docker/target-950pr/Dockerfile.x86_64
+    build_script: build_950pr_x86_64.sh
+    platform: linux/amd64
+    emulated: false
+    base_image: ubuntu:24.04
+    python: "3.12"
+    deps_dir: deps/950pr-x86_64
+    deps_manifest: docker/target-950pr/deps.manifest
+    soc:
+      # Lowercase and upstream's own value. vllm-ascend gates the 950 paths on
+      # the case-sensitive CMake regex `SOC_VERSION MATCHES "ascend950"`, so
+      # the vendor spelling "Ascend950PR" matches nothing. Derive the real
+      # value per machine from `npu-smi info -t board -i 0`.
+      soc_version: ascend950dt_9582
+      aicore_arch: dav-v300            # UNVERIFIED against a CANN 9.x payload
+      device_family: A5
+      dtype: null                      # bf16-capable; do not force a dtype
+    stack:
+      # Read out of vllm-ascend@main (requirements.txt, pyproject.toml) and its
+      # Dockerfile.a5, which is upstream's own 950/A5 reference image.
+      cann: 9.1.0
+      nnal: 9.1.0                      # ATB; sourced before the wheel build
+      vllm: 0.27.1                     # built from source, VLLM_TARGET_DEVICE=empty
+      vllm_ascend: main                # no tagged release carries the A5 gates yet
+      torch: 2.10.0
+      torch_npu: 2.10.0.post4          # Ascend mirror only, not on PyPI
+      torchvision: 0.25.0
+      triton_ascend: 3.2.2
+    patches: []                        # none, by design
+    operator_coverage:
+      # Upstream currently puts ascend950 on the same CMake branch as
+      # ascend310p, so this is a SUBSET, not the full DaVinci v3 set.
+      vllm_ascend_kernels: skipped
+      mla_preprocess: excluded
+      batch_matmul_transpose: excluded
+      atb_and_direct_kernels: not-defined
+      note: see docs/target-950pr-x86_64.md "Operator coverage"
+    verify:
+      script: docker/target-950pr/verify_runtime.sh
+      assertions_on_build_host: 9
+    artifact: artifacts/vllm-ascend-950pr-x86_64-offline.tar.gz
+
+builders:
+
+  cross-x86_64:
+    status: legacy
+    description: >-
+      x86_64 cross-compilation toolchain: aarch64-linux-gnu GCC plus an
+      assembled aarch64 CANN sysroot. Superseded for image builds by the
+      emulated native path, kept for kernel and ACL app development.
+    dockerfile: docker/builder-x86_64/Dockerfile
+    platform: linux/amd64
+    stack:
+      cann: 8.5.0
+    verify:
+      script: docker/builder-x86_64/verify.sh

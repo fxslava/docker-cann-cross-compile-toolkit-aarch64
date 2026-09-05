@@ -107,6 +107,18 @@ One forward-looking hint already present: vllm-ascend 0.13.0's `setup.py` maps
 `ascend910_9579` to device family `A5`, so the plugin anticipates a generation
 that this CANN does not yet build for.
 
+**That separate image now exists as a scaffold.** `docker/target-950pr/` targets
+a 950-class part on CANN **9.1.0** and x86_64, and [docs/target-950pr-x86_64.md](target-950pr-x86_64.md)
+carries its release matrix, its staging plan and the probe evidence that 9.1.0
+is the right line to pin. Two findings there change what this section implies:
+
+* The real SoC string is lowercase `ascend950dt_9582`, not `Ascend950PR`; every
+  upstream gate is the case-sensitive CMake regex `SOC_VERSION MATCHES "ascend950"`.
+* `ascend950` is currently handled on the *same* branch as `ascend310p` in
+  vllm-ascend's CMake, so the 950 operator set is a subset today: the kernels
+  library is skipped and MLAPO is excluded. A 950 image is not automatically
+  the fuller one.
+
 ---
 
 ## 3. The knobs, in one place

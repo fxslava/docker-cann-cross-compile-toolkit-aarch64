@@ -1,0 +1,54 @@
+# ---------------------------------------------------------------------------
+# Dependency staging plan for the 950PR x86_64 image.
+#
+# Every artefact that deps/950pr-x86_64/ must contain for
+# Dockerfile.x86_64 to build with --network=none. build_950pr_x86_64.sh reads
+# this file and refuses to start until each row is satisfied, so the plan is
+# enforced rather than merely written down.
+#
+# Format:  kind | path relative to DEPS_DIR | bytes | sha256 | source
+#   kind    file | dir | glob
+#   bytes   0 means "not size-checked" (directories, and sets whose size
+#           depends on the resolve)
+#   sha256  '-' means UNPINNED. Sizes below were measured with HTTP range
+#           requests against the live bucket on 2026-09-05; the hashes cannot
+#           be known without downloading the file, so pin each one from the
+#           first verified fetch, the way download_deps.sh already does for
+#           the 8.5.0 artefacts.
+#
+# CANN 9.1.0 IS THE PINNED LINE, and it is real: probing the Huawei OBS bucket
+# the way download_deps.sh documents returns 206 for 9.0.0 and 9.1.0 and 403
+# ("no such version string") for 8.6.x, 9.0.RC1, 9.1.RC1, 9.2.0 and 9.5.0.
+# quay.io/ascend/cann publishes matching 9.1.0-950-* images, and upstream
+# vllm-ascend's Dockerfile.a5 builds on 9.1.0-950-ubuntu22.04-py3.12.
+# ---------------------------------------------------------------------------
+
+# --- CANN 9.1.0, x86_64 ----------------------------------------------------
+file|Ascend-cann-toolkit_9.1.0_linux-x86_64.run|1298337341|-|https://ascend-repo.obs.cn-east-2.myhuaweicloud.com/CANN/CANN%209.1.0/Ascend-cann-toolkit_9.1.0_linux-x86_64.run
+file|Ascend-cann-nnal_9.1.0_linux-x86_64.run|572750476|-|https://ascend-repo.obs.cn-east-2.myhuaweicloud.com/CANN/CANN%209.1.0/Ascend-cann-nnal_9.1.0_linux-x86_64.run
+
+# --- Ubuntu 24.04 (noble, amd64) local apt archive -------------------------
+# The .deb closure of docker/target-950pr/packages/sys_packages.txt plus a
+# dpkg-scanpackages index, built the way scripts/fetch_debs.sh does for the
+# 310P but in a noble container and with no QEMU in the way.
+dir|apt_debs|0|-|apt-get install --download-only inside ubuntu:24.04
+file|apt_debs/Packages.gz|0|-|dpkg-scanpackages . > Packages && gzip -k Packages
+
+# --- cp312 / manylinux x86_64 wheelhouse -----------------------------------
+# Resolved from docker/target-950pr/requirements/python_wheels.txt.
+# torch-npu 2.10.0.post4 and triton-ascend 3.2.2 are NOT on PyPI; they come
+# from https://mirrors.huaweicloud.com/ascend/repos/pypi. This is the single
+# most likely staging failure - see docs/target-950pr-x86_64.md.
+dir|python_wheels|0|-|pip download -r requirements/python_wheels.txt
+glob|python_wheels/torch-2.10.0*.whl|0|-|https://download.pytorch.org/whl/cpu
+glob|python_wheels/torch_npu-2.10.0.post4*.whl|0|-|https://mirrors.huaweicloud.com/ascend/repos/pypi
+
+# The vLLM wheel is BUILT, not downloaded: PyPI's x86_64 vllm is a CUDA build.
+# Build v0.27.1 from source with VLLM_TARGET_DEVICE=empty and drop the wheel
+# here, exactly as the 310P pipeline does via scripts/build_vllm_wheel.sh.
+glob|python_wheels/vllm-0.27.1*.whl|0|-|built from source, VLLM_TARGET_DEVICE=empty
+
+# --- vllm-ascend source ----------------------------------------------------
+# Built from source in stage 6. No patches are applied for this target.
+file|src/vllm-ascend/setup.py|0|-|git clone -b <ref> https://github.com/vllm-project/vllm-ascend.git
+file|src/vllm-ascend/requirements.txt|0|-|same checkout

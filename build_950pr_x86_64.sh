@@ -1,0 +1,186 @@
+#!/usr/bin/env bash
+# ---------------------------------------------------------------------------
+# Build the native x86_64 Ascend 950PR inference image.
+#
+#   ./build_950pr_x86_64.sh                        build and load into the daemon
+#   ./build_950pr_x86_64.sh --save out.tar.gz      build, then export via pigz
+#   ./build_950pr_x86_64.sh --no-cache             anything unrecognised goes to buildx
+#
+# Environment:
+#   TAG         image tag        (default vllm-ascend-950pr:x86_64-offline)
+#   CONTEXT     build context    (default the directory holding this script)
+#   DEPS_DIR    offline payload  (default $CONTEXT/deps/950pr-x86_64)
+#   TARGET_DIR  image assets     (default $CONTEXT/docker/target-950pr)
+#   SOC_VERSION build SoC        (default ascend950dt_9582)
+#   BASE_IMAGE  base             (default ubuntu:24.04)
+#
+# UNLIKE build_aarch64.sh THERE IS NO QEMU HERE. Host and target are both
+# x86_64, so there is no binfmt registration, no emulation tax and no
+# host-architecture unpacker stage - the CANN installer runs natively.
+#
+# The RUN steps execute with --network=none, so a successful build is itself
+# the proof that the payload is complete. Only the base image and the BuildKit
+# frontend are fetched from a registry, and only when not already cached.
+# ---------------------------------------------------------------------------
+set -euo pipefail
+
+CONTEXT="${CONTEXT:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
+DEPS_DIR="${DEPS_DIR:-$CONTEXT/deps/950pr-x86_64}"
+TARGET_DIR="${TARGET_DIR:-$CONTEXT/docker/target-950pr}"
+TAG="${TAG:-vllm-ascend-950pr:x86_64-offline}"
+BASE_IMAGE="${BASE_IMAGE:-ubuntu:24.04}"
+SOC_VERSION="${SOC_VERSION:-ascend950dt_9582}"
+CANN_VERSION="${CANN_VERSION:-9.1.0}"
+
+SAVE_TO=""
+EXTRA=()
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --save) SAVE_TO="$2"; shift 2 ;;
+        *)      EXTRA+=("$1"); shift ;;
+    esac
+done
+
+die() { echo "ERROR: $*" >&2; exit 1; }
+
+# --- preflight -------------------------------------------------------------
+echo "=== preflight ==="
+command -v docker >/dev/null || die "docker not on PATH"
+
+host_arch=$(uname -m)
+if [ "$host_arch" = "x86_64" ]; then
+    echo "  host     : $host_arch (native build, no emulation)"
+else
+    echo "  host     : $host_arch - this target is linux/amd64, so every step"
+    echo "             below would run under emulation. Expect a large slowdown."
+fi
+
+docker buildx ls | grep -q 'linux/amd64' || die "buildx does not offer linux/amd64"
+echo "  buildx   : linux/amd64 available"
+
+if docker image inspect "$BASE_IMAGE" >/dev/null 2>&1; then
+    echo "  base     : $BASE_IMAGE cached"
+else
+    echo "  base     : $BASE_IMAGE not cached locally; BuildKit will fetch it"
+fi
+
+# THE CASE TRAP, CHECKED EARLY. vllm-ascend gates every 950 code path on the
+# CMake regex `SOC_VERSION MATCHES "ascend950"`, which is case-sensitive, and
+# setup.py demands a value starting with ascend950. The vendor spelling
+# "Ascend950PR" matches nothing and produces a wrong-but-quiet build, so refuse
+# it here rather than three hundred seconds into a wheel compile.
+case "$SOC_VERSION" in
+    ascend950*) echo "  soc      : $SOC_VERSION" ;;
+    *) die "SOC_VERSION='$SOC_VERSION' does not start with lowercase 'ascend950'.
+       vllm-ascend's CMake gates are case-sensitive; 'Ascend950PR' silently
+       matches nothing. On real silicon derive the value from
+       'npu-smi info -t board -i 0' as (Chip Name + \"_\" + NPU Name) lowercased,
+       e.g. ascend950dt_9582 (what upstream's Dockerfile.a5 ships)." ;;
+esac
+
+# No patches for this target, by design: vllm-ascend@main handles ascend950 in
+# its own CMake gates and csrc/kernels/unsupported_310p.cpp does not exist
+# there. Fail loudly if someone copies the 310P patch set in.
+if [ -d "$TARGET_DIR/patches" ] && ls "$TARGET_DIR"/patches/*.patch >/dev/null 2>&1; then
+    die "$TARGET_DIR/patches/ contains patches. The 950 target applies none -
+       see the stage 6 note in Dockerfile.x86_64. Remove them or move them
+       behind an explicit flag before building."
+fi
+echo "  patches  : none (correct for this target)"
+
+# --- offline payload, checked against the staging manifest ------------------
+MANIFEST="$TARGET_DIR/deps.manifest"
+[ -f "$MANIFEST" ] || die "missing $MANIFEST"
+
+missing=()
+while IFS='|' read -r kind path bytes sha src; do
+    case "${kind// /}" in ''|'#'*) continue ;; esac
+    path="${path// /}"; bytes="${bytes// /}"
+    full="$DEPS_DIR/$path"
+    case "$kind" in
+        file)
+            if [ ! -f "$full" ]; then
+                missing+=("$path  <- ${src%% *}")
+            elif [ "${bytes:-0}" != "0" ] && [ "$(stat -c%s "$full")" != "$bytes" ]; then
+                missing+=("$path  (size $(stat -c%s "$full"), expected $bytes)")
+            fi
+            ;;
+        dir)
+            [ -d "$full" ] || missing+=("$path/  <- ${src%% *}")
+            ;;
+        glob)
+            # shellcheck disable=SC2086
+            ls $full >/dev/null 2>&1 || missing+=("$path  <- ${src%% *}")
+            ;;
+    esac
+done < "$MANIFEST"
+
+if [ "${#missing[@]}" -gt 0 ]; then
+    printf 'ERROR: offline payload incomplete in %s\n' "$DEPS_DIR" >&2
+    printf '  - %s\n' "${missing[@]}" >&2
+    echo >&2
+    echo "  The staging plan and the exact download URLs are in" >&2
+    echo "  $MANIFEST and docs/target-950pr-x86_64.md." >&2
+    exit 1
+fi
+echo "  deps     : $(du -sh "$DEPS_DIR" | cut -f1) in $DEPS_DIR (manifest satisfied)"
+
+# The AI Core arch string is the one value here this repo has never verified
+# against a real CANN 9.x payload. If the toolkit has been extracted next to
+# the payload, check it now; otherwise say so rather than implying it is known.
+hc=$(find "$DEPS_DIR" -maxdepth 6 -name host_config.cmake -path '*ascendc_kernel_cmake*' 2>/dev/null | head -1)
+if [ -n "$hc" ]; then
+    if grep -qE '^set\(ascend950[a-z0-9_]*_list' "$hc"; then
+        echo "  soc list : ascend950 present in $(basename "$hc")"
+    else
+        echo "  soc list : WARNING - no ascend950 list in $hc" >&2
+    fi
+else
+    echo "  soc list : not checked (toolkit not extracted); ASCEND_AICORE_ARCH is"
+    echo "             unverified for this CANN release - see docs/target-950pr-x86_64.md"
+fi
+
+# --- build -----------------------------------------------------------------
+echo
+echo "=== building $TAG (linux/amd64, --network=none) ==="
+start=$(date +%s)
+
+docker buildx build \
+    --platform linux/amd64 \
+    --network=none \
+    --progress=plain \
+    --build-arg BASE_IMAGE="$BASE_IMAGE" \
+    --build-arg CANN_VERSION="$CANN_VERSION" \
+    --build-arg SOC_VERSION="$SOC_VERSION" \
+    -f "$TARGET_DIR/Dockerfile.x86_64" \
+    -t "$TAG" \
+    --load \
+    "${EXTRA[@]}" \
+    "$CONTEXT"
+
+elapsed=$(( $(date +%s) - start ))
+echo
+printf '=== built in %dm %ds ===\n' $((elapsed / 60)) $((elapsed % 60))
+docker image ls "$TAG"
+
+# --- export ----------------------------------------------------------------
+if [ -n "$SAVE_TO" ]; then
+    echo
+    echo "=== saving $TAG -> $SAVE_TO ==="
+    mkdir -p "$(dirname "$SAVE_TO")"
+    case "$SAVE_TO" in
+        # A .gz destination streams through pigz instead of landing a multi-GB
+        # tar on disk first. docker load reads gzip natively, so the archive
+        # needs no separate decompression step on the target host.
+        *.gz)
+            command -v pigz >/dev/null || die "pigz not on PATH (apt-get install pigz)"
+            docker save "$TAG" | pigz -p "$(nproc)" > "$SAVE_TO"
+            ;;
+        *)
+            docker save "$TAG" -o "$SAVE_TO"
+            ;;
+    esac
+    echo "  $(stat -c %s "$SAVE_TO") bytes  ($(du -h "$SAVE_TO" | cut -f1))  $SAVE_TO"
+    echo "  sha256: $(sha256sum "$SAVE_TO" | cut -d" " -f1)"
+    echo "  copy to the target host, then: docker load -i $(basename "$SAVE_TO")"
+fi
