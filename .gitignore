@@ -7,3 +7,7 @@ deps/
 *.run
 *.whl
 *.tar
+
+# Exported images (docker save | gzip). Multi-GB, regenerated on demand.
+artifacts/
+*.tar.gz

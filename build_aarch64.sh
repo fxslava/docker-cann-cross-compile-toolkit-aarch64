@@ -61,9 +61,8 @@ else
     echo "  base     : $BASE_IMAGE (arm64) cached"
 fi
 
-# patches/ is bind-mounted by stage 6 and is not optional: vllm-ascend v0.13.0
-# does not build for a 310P without it. A missing directory here would surface
-# as an opaque BuildKit mount error hours into the build.
+# Not optional: vllm-ascend v0.13.0 does not build for a 310P without these, and
+# a missing directory would surface as an opaque mount error hours in.
 ls "$CONTEXT"/patches/*.patch >/dev/null 2>&1 \
     || die "no $CONTEXT/patches/*.patch; the 310P build needs them (see README.aarch64.md)"
 echo "  patches  : $(ls "$CONTEXT"/patches/*.patch | wc -l) for vllm-ascend"

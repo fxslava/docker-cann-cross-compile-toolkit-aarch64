@@ -90,17 +90,13 @@ dt=$(python3 -c "from vllm_ascend import _build_info; print(_build_info.__device
     || bad "vllm_ascend built for '${dt:-unknown}', expected _310P"
 
 step "5. Compiled extension"
-# libvllm_ascend_kernels.so, which vllm_ascend_C pulls in, registers its device
-# binaries from an ELF constructor that first calls AscendCheckSoCVersion(). On
-# a host with no NPU aclrtGetSocName() returns NULL, that check builds a
-# std::string from it, and the process dies with
-#   terminate called after throwing an instance of 'std::logic_error'
-#   what():  basic_string::_S_construct null not valid
-# before Python sees anything it could catch. That is a property of the CANN
-# runtime, not of this image, so only assert the import where a device exists.
-# It is also why nothing in Dockerfile.aarch64 imports vllm_ascend_C: the build
-# host has no NPU. `ldd -r` still proves the module has no unresolved symbols
-# of its own, which is the part a build host can honestly check.
+# libvllm_ascend_kernels.so registers its device binaries from an ELF
+# constructor calling CANN's AscendCheckSoCVersion(). With no NPU,
+# aclrtGetSocName() returns NULL, that builds a std::string from it, and the
+# process aborts before Python can catch anything -- a property of the CANN
+# runtime, not of this image. So assert the import only where a device exists,
+# and on a build host check what a build host can: that the module exists and
+# has no unresolved symbols of its own.
 ext_so=$(python3 - <<'PY' 2>/dev/null
 import glob, os, vllm_ascend
 d = os.path.dirname(vllm_ascend.__file__)

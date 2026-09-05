@@ -156,9 +156,9 @@ docker pull docker/dockerfile:1.7
 
 `deps/src/vllm-ascend` stays a pristine upstream checkout. The local changes live in `patches/` and are applied to the *copy* in stage 6, so re-provisioning never has to undo anything and bumping `VLLM_ASCEND_REF` only means rebasing the diff. Each patch carries its rationale in a header above the diff; `patches/0001-vllm-ascend-0.13.0-ascend310p-kernel-gates.patch` is the one that makes v0.13.0 build:
 
-* **The SoC gates never fire.** `CMakeLists.txt` reads `if(SOC_VERSION STREQUAL "ASCEND310P3")` while `setup.py` will only accept the lowercase spelling (see below), so the 910B-only kernels are handed to `ccec` for `dav-m200` and the build dies in `csrc/batch_matmul_transpose/op_kernel/` on `PIPE_FIX`, a synchronisation pipe that exists only on 910/910B. The patch folds the case once into a `SOC_IS_310P` flag that matches the whole 310P family.
-* **`mla_preprocess` is missing from the exclusion list.** Even with the gates firing, `csrc/mla_preprocess/op_kernel/mla_preprocess_kernel.cpp` is `ArchType::ASCEND_V220` code that instantiates `MLAOperation` over `__bf16` — a type the 310P AI Core does not have — so `ccec` rejects it with `unknown type name 'bfloat16_t'`. It is now excluded. (MLA is a DeepSeek path that does not run on a 310P regardless.) While there, the four LoRA entries in that list are respelled: they were written as `${KERNEL_FILES}/bgmv_expand.cpp`, and since `KERNEL_FILES` is a `;`-list of absolute paths that expands to the wrong set — it dropped `pos_encoding_kernels.cpp` and `get_masked_input_and_mask_kernel.cpp`, which *do* build for `dav-m200`, and kept one LoRA kernel, which does not. The LoRA kernels fail in the host stub pass, where `__CCE_AICORE__` is undefined so their `#if !defined(__CCE_AICORE__) || (__CCE_AICORE__ >= 220)` guard opens and the launch of `bgmv_shrink_bfloat16_t` comes out "not configured".
-* **The resulting module could not be imported.** The 310P branch also dropped `batch_matmul_transpose`'s host tiling TU while `csrc/torch_binding.cpp` still calls into it, leaving `vllm_ascend_C.so` with undefined `pp_matmul::GetPpMatmulTiling` and `pp_matmul::HardwareInfo::HardwareInfo`. That TU is ordinary host C++ and is now compiled on every SoC. A new `csrc/soc_stubs/unsupported_310p.cpp` supplies the six `*_impl` entry points of the excluded kernels, so the module links and a call raises a clear error rather than the whole extension failing to load. None of those ops is reachable on a 310P through `vllm-ascend`'s own dispatch — LoRA falls back to `vllm.lora.ops.torch_ops` in `vllm_ascend/lora/punica_npu.py`, and MLA and sparse attention are gated on `AscendDeviceType._310P`.
+* **The SoC gates never fire.** `CMakeLists.txt` reads `if(SOC_VERSION STREQUAL "ASCEND310P3")` while `setup.py` accepts only the lowercase spelling (see below), so 910B-only kernels reach `ccec` and the build dies on `PIPE_FIX`, a sync pipe that exists only on 910/910B. The patch folds the case into a `SOC_IS_310P` flag matching the whole family.
+* **`mla_preprocess` is missing from the exclusion list.** It is `ArchType::ASCEND_V220` code instantiating `MLAOperation` over `__bf16`, which the 310P AI Core does not have, so `ccec` rejects it with `unknown type name 'bfloat16_t'`. MLA is a DeepSeek path that does not run on a 310P regardless. The four LoRA entries in that list are also respelled: written as `${KERNEL_FILES}/bgmv_expand.cpp` against a `;`-list of absolute paths, they expanded to the wrong set — dropping `pos_encoding_kernels.cpp` and `get_masked_input_and_mask_kernel.cpp`, which *do* build here, and keeping a LoRA kernel, which does not.
+* **The resulting module could not be imported.** The 310P branch also dropped `batch_matmul_transpose`'s host tiling TU that `csrc/torch_binding.cpp` still calls, leaving undefined `pp_matmul` symbols. That TU is ordinary host C++ and is now built on every SoC, and `csrc/soc_stubs/unsupported_310p.cpp` supplies the six `*_impl` entry points of the excluded kernels so the module links and a call raises instead of the extension failing to load.
 
 `ldd -r` on the finished extension reports no unresolved symbols beyond the Python C API, which `verify_runtime.sh` asserts.
 
@@ -186,6 +186,11 @@ The CMake side is then fixed rather than worked around: the patch above replaces
 ```bash
 docker run --rm vllm-ascend-310p:aarch64-offline verify
 ```
+
+> **Build time.** A cold build is ~22 min, 47% of which is the CANN `.run`
+> installer running under emulation; a warm rebuild after a source change is
+> ~6 min, almost all of it the vllm-ascend wheel. `docs/cross-compilation-analysis.md`
+> has the full breakdown and measures how far a split host/target build gets.
 
 `verify_runtime.sh` checks the architecture, the Python version, the CANN install, the compiled `vllm_ascend_C` extension, and that `vllm_ascend` was built for device family `_310P`. Its core assertion is the acceptance check:
 
@@ -305,6 +310,10 @@ requirements-optional.aarch64.txt  best-effort extras (a miss is not fatal)
 constraints.aarch64.txt        keeps the resolve on +cpu torch, off CUDA
 cann_extra.aarch64.txt         CANN libraries the toolkit .run omits
 patches/                       local fixes applied to vllm-ascend at build time
+docs/cross-compilation-analysis.md  where the build time goes, and how far a
+                               split host/target build gets (with measurements)
+docs/analyze_build.py          per-step timing breakdown of a buildx log
+artifacts/                     exported image tarballs (git-ignored)
 entrypoint.sh                  NPU detection + vllm serve launcher
 verify_runtime.sh              in-image verification suite
 deps/                          provisioned payload (git-ignored)

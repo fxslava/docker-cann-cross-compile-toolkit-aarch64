@@ -6,18 +6,16 @@
 #  Image  : linux/arm64, Ubuntu 22.04, Python 3.10
 #  Target : Ascend 310P3 servers (AI Core arch dav-m200)
 #
-#  Contains CANN 8.5.0 (AArch64), PyTorch 2.10.0+cpu, torch_npu 2.10.0.post4,
-#  vLLM 0.27.1 (VLLM_TARGET_DEVICE=empty) and vllm-ascend built from source,
-#  so the image can be saved to a tar and run on an air-gapped Ascend host.
+#  Contains CANN 8.5.0 (AArch64), PyTorch 2.8.0+cpu, torch_npu 2.8.0.post2,
+#  vLLM 0.13.0 (VLLM_TARGET_DEVICE=empty) and vllm-ascend 0.13.0 built from
+#  source, so the image can be saved to a tar and run air-gapped.
 #
 #  WHY EMULATION INSTEAD OF CROSS-COMPILATION
-#  The sibling ./Dockerfile cross-builds AArch64 artefacts from an x86_64 CANN
-#  toolkit. That works for Ascend C kernels and ACL applications, but it cannot
-#  build vllm-ascend: its CMakeLists runs `import torch` to check the version
-#  and its setup.py shells out to `pip show torch-npu` for the target headers,
-#  so build-host and target Python must be the same interpreter. Running the
-#  whole build as aarch64 also sidesteps the op_build dlopen mismatch, because
-#  op_build and the libraries it loads are then both AArch64.
+#  vllm-ascend's build needs the TARGET interpreter: CMakeLists runs
+#  `import torch` for the version check and setup.py shells out to
+#  `pip show torch-npu` for the target headers. Emulating the whole build also
+#  keeps op_build and the libraries it dlopens on the same architecture.
+#  See README.aarch64.md for what a split host/target build would still cost.
 #
 #  EVERY STEP BELOW IS OFFLINE. The build takes no network at all:
 #    apt     -> deps/apt_debs (local file: repository)
@@ -39,26 +37,12 @@ ARG DEBIAN_FRONTEND=noninteractive
 ARG CANN_VERSION=8.5.0
 ARG ASCEND_BASE=/usr/local/Ascend
 
-# SOC_VERSION IS DELIBERATELY LOWERCASE, and vllm-ascend v0.13.0 leaves no
-# spelling that satisfies all of its readers at once:
-#
-#   * setup.py gen_build_info() does `assert soc_version in soc_to_device`
-#     against an all-lowercase dict, and writes the resulting device family
-#     into vllm_ascend/_build_info.py. That file is what the RUNTIME dispatches
-#     on, and gen_build_info runs from build_py -- i.e. on every
-#     `setup.py bdist_wheel`. "ASCEND310P3" fails that assert outright.
-#   * CMakeLists.txt gates its kernel-exclusion lists on
-#     `if(SOC_VERSION STREQUAL "ASCEND310P3")`, which no value accepted by the
-#     assert above can match.
-#
-# "ascend310p3" is the side worth keeping: it is the real chip, it passes the
-# assert, it produces __device_type__ = '_310P' so the installed plugin
-# dispatches as an Atlas 300I, and it is what CANN's ascendc cmake stamps into
-# the kernel library's SoC check. verify_runtime.sh asserts the _310P value.
-#
-# The CMake side is then fixed properly rather than worked around: patches/
-# replaces those two STREQUAL gates with one case-insensitive SOC_IS_310P flag.
-# Applied in stage 6.
+# SOC_VERSION IS DELIBERATELY LOWERCASE. setup.py's gen_build_info() asserts it
+# against an all-lowercase table and writes the device family that the RUNTIME
+# dispatches on, so "ASCEND310P3" fails the build outright; CMakeLists.txt then
+# gates its kernel exclusions on the uppercase spelling, which that assert can
+# never accept. patches/ resolves the conflict by making the CMake gate
+# case-insensitive. verify_runtime.sh asserts the resulting _310P.
 ARG SOC_VERSION=ascend310p3
 ARG COMPILE_CUSTOM_KERNELS=1
 
@@ -123,11 +107,11 @@ RUN --mount=type=bind,source=deps/Ascend-cann-toolkit_${CANN_VERSION}_linux-aarc
 # `import torch` dies before anything else runs:
 #     ImportError: libtorch_npu.so: undefined symbol: HcclReduceScatter
 #
-# This is a genuinely missing implementation, not a naming gap: of the ten HCCL
-# symbols torch_npu resolves by name, the split libraries provide four, and
-# nothing in the toolkit defines HcclAllReduce, HcclAllGather, HcclBroadcast,
-# HcclReduceScatter, HcclSend or HcclRecv. provision_deps_aarch64.sh stages the
-# real library out of Huawei's own CANN 8.5.0 image; see step 1b there.
+# A missing implementation, not a naming gap: of the ten HCCL symbols torch_npu
+# resolves, the split libraries provide four and nothing in the toolkit defines
+# HcclAllReduce, HcclAllGather, HcclBroadcast, HcclReduceScatter, HcclSend or
+# HcclRecv. provision_deps_aarch64.sh stages the real library out of Huawei's
+# own CANN 8.5.0 image; see step 1b there.
 RUN --mount=type=bind,source=deps/cann_extra,target=/cann_extra \
     set -eu; \
     lib="${ASCEND_BASE}/ascend-toolkit/latest/lib64"; \
@@ -206,38 +190,24 @@ RUN --mount=type=bind,source=deps/python_wheels,target=/opt/wheels \
 # The source is copied out of the read-only bind mount because setup.py writes
 # _version.py, _build_info.py, build/ and .deps/ back into the tree.
 #
-# --no-build-isolation is required, not merely faster: vllm-ascend's
-# pyproject.toml build-system lists triton-ascend==3.2.2, which is published
-# only on Huawei's mirror and which upstream uninstalls again immediately after
-# building. An isolated build env would try to fetch it and there is no network.
-# Everything the build actually needs (setuptools-scm, cmake>=3.26, pybind11,
-# torch, torch_npu) is already installed by stage 5.
+# patches/ carries the local fixes to vllm-ascend, each documenting its rationale
+# above its diff; deps/src stays pristine so a ref bump only means rebasing them.
+# The 310P build does not work without them. The upstream .git is dropped first
+# because setuptools-scm shells out to git during bdist_wheel and rejects the
+# provisioning user's checkout as dubious ownership; the version comes from
+# SETUPTOOLS_SCM_PRETEND_VERSION, and `git apply` needs no repository.
 #
-# --no-deps for the same reason: install_requires is generated from
-# requirements.txt including those unpublished extras. Stage 5 already
-# installed the filtered dependency set.
+# --no-build-isolation and --no-deps are both required, not merely faster:
+# pyproject.toml's build-system and requirements.txt name triton-ascend and
+# other packages published only on Huawei's mirror, and there is no network.
+# Stage 5 already installed everything the build needs.
 #
 # deps/third_party is merged into csrc/third_party, which is what
 # ${CANN_3RD_LIB_PATH} defaults to. On v0.13.0 for a 310P that payload is empty
-# and the merge is a no-op: csrc/build_aclnn.sh `exit 0`s straight away because
-# the release ships no custom ACLNN ops for the 310P series. Refs that DO have
-# one (main, for instance) fetch abseil-cpp, protobuf, nlohmann/json and
-# makeself from gitcode.com, and each of those cmake modules checks
-# ${CANN_3RD_LIB_PATH} before reaching for the network -- so staging them here
-# is what keeps such a ref buildable offline. makeself additionally falls back
-# to the copy CANN ships for its own op packaging.
-#
-# patches/ carries the local changes to vllm-ascend; each file documents its own
-# rationale in a header above the diff. deps/src stays a pristine upstream
-# checkout, so re-provisioning never has to undo anything and a ref bump only
-# has to rebase these. The 310P build does not work without them; see
-# patches/0001-vllm-ascend-0.13.0-ascend310p-kernel-gates.patch.
-#
-# The upstream .git is dropped from the copy first: setuptools-scm shells out to
-# git during bdist_wheel, and the checkout is owned by the provisioning user, so
-# git refuses it as dubious ownership and the wheel step fails. The version is
-# pinned through SETUPTOOLS_SCM_PRETEND_VERSION anyway. `git apply` needs no
-# repository.
+# and the merge is a no-op -- csrc/build_aclnn.sh exits immediately because the
+# release ships no custom ACLNN ops for the 310P. Refs that do have one fetch
+# abseil-cpp, protobuf, nlohmann/json and makeself from gitcode.com and check
+# ${CANN_3RD_LIB_PATH} first, so staging them keeps such a ref buildable offline.
 RUN --mount=type=bind,source=deps/python_wheels,target=/opt/wheels \
     --mount=type=bind,source=deps/third_party,target=/third_party \
     --mount=type=bind,source=deps/src/vllm-ascend,target=/src/vllm-ascend \
