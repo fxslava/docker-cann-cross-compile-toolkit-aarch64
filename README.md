@@ -83,11 +83,11 @@ compiled against**. See [§9](#9-the-zero-cuda-guarantee).
 | **Triton** | — | `triton-ascend` 3.2.2 (replaces NVIDIA triton) |
 | **Kernel compilation scope** | `ascendc_library(vllm_ascend_kernels)` **is** built; bf16/`PIPE_FIX` kernels excluded by a local patch. **No ACLNN custom-op package.** | `vllm_ascend_kernels` **skipped** by upstream's `ascend950` CMake gate; instead `csrc/build_aclnn.sh` builds **27 ACLNN ops → 493 kernel binaries** via `ccec`/`bisheng` |
 | **Patches applied** | 1 (`patches/0001-…-ascend310p-kernel-gates.patch`) | none, by design — `build.sh` refuses to start if any appear |
-| **Cold build** | **745 s** (~12.5 min) | **86 m 58 s** (~87 min; the kernel compile *is* the build) |
+| **Cold build** | **745 s** (~12.5 min) | **95 m 20 s** (~88 min of it is the kernel compile — it *is* the build) |
 | **Warm rebuild** | ~6 min (mostly the wheel) | ~7 s if the edit lands after the kernel stage |
 | **Payload size** | ~2 GB in `deps/` (CANN alone is 1.1 GB) | 3.8 GB in `deps/950pr-x86_64/` |
 | **Image size** | 8.03 GB (2.01 GB content) | 12.8 GB disk (3.25 GB content) |
-| **Artefact** | 1,989,784,456 B (1.99 GB) | 3,224,198,617 B (3.1 GB) |
+| **Artefact** | 1,989,784,456 B (1.99 GB) | 3,224,204,628 B (3.1 GB) |
 | **Verify on a build host** | **9 / 9** | **10 / 10** |
 | **Host RAM** | 8–16 GB adequate | **≥ 24 GB, 32 GB recommended** |
 | **Host disk** | ~40 GB | ~50 GB |
@@ -109,7 +109,7 @@ interpreter must be *the same interpreter*. Building the whole image as AArch64
 also removes the `op_build` `dlopen` architecture mismatch.
 
 For the 950PR the question does not arise: host and target are both `x86_64`,
-so every step runs natively at full speed. The 87 minutes it takes are *real
+so every step runs natively at full speed. The 88 minutes it takes are *real
 compute* (493 kernel binaries), not an emulation tax.
 
 The one place the 310P build escapes emulation is the CANN installer: it is a
@@ -267,7 +267,7 @@ sudo apt-get install -y pigz
 | Exported artefact | 1.99 GB | 3.1 GB |
 | **Practical free space** | **~40 GB** | **~50 GB** |
 | **RAM** | 8–16 GB | **≥ 24 GB (32 GB recommended)** |
-| Cores | any (emulation-bound) | 12+ recommended; the measured 87 min was on 12 |
+| Cores | any (emulation-bound) | 12+ recommended; the measured 88 min was on 12 |
 
 The 950PR RAM figure is driven by the ACLNN kernel compile: `ninja` runs
 `bisheng`/`ccec` across all cores and each kernel translation unit is
@@ -504,13 +504,13 @@ path on the CMake regex `SOC_VERSION MATCHES "ascend950"`, which is
 The vendor spelling `Ascend950PR` matches nothing and produces a
 wrong-but-quiet build.
 
-### Caching: how not to lose 87 minutes
+### Caching: how not to lose 88 minutes
 
 BuildKit keys a layer on **the literal command string plus the content of its
 mounts**. That single fact drives every caching rule here.
 
 For the 950PR, stage 6 (the `vllm-ascend` build) compiles 493 kernel binaries
-and takes ~87 minutes. It is invalidated by:
+and takes ~88 minutes. It is invalidated by:
 
 * any edit to that `RUN`'s command text — **including a comment inside it**;
 * a content change in anything it mounts: `deps/950pr-x86_64/python_wheels`,
@@ -530,7 +530,7 @@ rebuilds in **~7 seconds** after a `verify_runtime.sh` edit.
 Practical rules:
 
 * **Batch your edits to the kernel stage.** Changing three things one at a time
-  costs 4½ hours; changing them together costs 87 minutes.
+  costs 4½ hours; changing them together costs 88 minutes.
 * **Never reference an external script from that `RUN`.** This is why
   `common/patches/cmake_fetchcontent_local.sh` is *not* called from the ACLNN
   compile step and its logic is inlined in both Dockerfiles instead — a mount
@@ -550,7 +550,7 @@ docker builder prune -a -f && docker system prune -f
 ```
 
 then rebuild and compare against the baselines in the matrix (745 s for the
-310P; 86 m 58 s for the 950PR).
+310P; 95 m 20 s for the 950PR, of which 88 m 30 s is the kernel stage).
 
 > **The 950PR kernel stage looks like a hang and is not.** BuildKit buffers that
 > stage's log, and the last ~10 `MlaPrologV3_*` kernels alone take ~30 minutes.
@@ -584,7 +584,7 @@ what you verify on the far side of the air gap.
 > 9p/drvfs boundary. Always verify the SHA-256 **on the destination**, and
 > prefer `cp` + verify + `rm` over `mv`: a cross-filesystem `mv` is a
 > copy-then-delete internally, so an interruption can leave you with neither
-> copy of something that took 87 minutes to build.
+> copy of something that took 95 minutes to build.
 
 ---
 

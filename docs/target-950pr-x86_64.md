@@ -323,7 +323,7 @@ mechanisms:
 
 So the CMake gate quoted below is real, but it only governs the *kernels
 library*. The ACLNN custom-op package is built by a different path and is by
-far the largest product of this image — roughly **87 minutes** of the build,
+far the largest product of this image — roughly **88 m 30 s** of the build,
 installed at `vllm_ascend/_cann_ops_custom/vendors/custom_transformer` with
 `libcust_opapi.so` alongside it. `verify_runtime.sh` now asserts its presence.
 
@@ -481,19 +481,46 @@ Unverified, and honestly so:
 
 ## 7. Measured results
 
-Built natively on x86_64 (12 cores, WSL2) with `--network=none`, from a payload
-staged by `targets/target-950pr/provision.sh`.
+Built natively on x86_64 (12 cores, WSL2) with `--no-cache --network=none`, from
+a payload staged by `targets/target-950pr/provision.sh`. The figures below are
+from the reproduction at commit `5449353` — a second, independent cold build
+that also served as the regression check on the `targets/` + `common/` refactor.
 
 | | |
 |---|---|
 | Base image | `ubuntu:22.04` (jammy), Python 3.10.12, glibc 2.35 |
-| Build time | **86m 58s** cold (kernel compilation is ~87m of it) |
-| Image | 3.25 GB content / 12.8 GB disk usage |
+| Build time | **95m 20s** cold, wall clock (10:35:47Z → 12:11:07Z), including image export and the `pigz` save |
+| — of which stage 6 | **5,310 s = 88m 30s** — the `vllm-ascend` wheel and its 493 ACLNN kernels, **93% of the build** |
+| — next three stages | CANN toolkit install 90 s · pip transactions 60 s · offline apt 28 s |
+| Image | `sha256:35510eb1…`, **20 layers**, 3,249,613,925 B content / 12.8 GB disk usage |
 | Artefact | `<project_root>/artifacts/vllm-ascend-950pr-x86_64-offline.tar.gz` on the **Windows** drive — see [repository-layout.md](repository-layout.md) |
-| Artefact size | **3,224,198,617 bytes** (3.1 GB), `docker save \| pigz` |
-| Artefact SHA-256 | `1d4435a4170c488883ff2b64313df2f16ca9f85a604a026b7488d76b80e13546` |
+| Artefact size | **3,224,204,628 bytes** (3.1 GB), `docker save \| pigz` |
+| Artefact SHA-256 | `f6e14dd12e62a6915502dab8b1f6b520b672e3080d39f68bae5931d8e6ba4c70` |
 | Payload | 3.8 GB in `deps/950pr-x86_64/` |
-| Verification | **10/10 passed, 0 failed** on a build host |
+| Verification | **10/10 passed, 0 failed** on a build host, from a green-field `docker load` |
+
+### Reproduced, and diffed against the previous build
+
+The image was deleted from the daemon and reconstructed **only** from the
+exported archive before being verified, so the 10/10 above is a property of the
+artefact, not of the build tree that produced it. `docker load` returned the
+same image id the build had written.
+
+Against the `e22b741` build of the same target:
+
+| | e22b741 | 5449353 | |
+|---|---|---|---|
+| Filesystem layers | 18 | **20** | expected: the refactor added `COPY common/patches/ascend_setenv_nounset.sh` and `COPY common/docker/compiler_env.sh` |
+| Image content size | 3,249,610,679 B | 3,249,613,925 B | +3,246 B — those two scripts |
+| Installed distributions | 233 | 233 | identical |
+| Distinct distribution names | 207 | 207 | **zero differences in either direction** |
+| `vllm_ascend_C` symbols | 118 | 118 | identical |
+| ACLNN package | 27 ops / 493 kernels / 793 files | same | identical |
+
+The layer count is the only structural change, and it is accounted for
+instruction by instruction: the pre-refactor Dockerfile had 17
+layer-producing instructions, this one has 19, and both add one base-image
+layer.
 
 Stack as built, confirmed from inside the image:
 

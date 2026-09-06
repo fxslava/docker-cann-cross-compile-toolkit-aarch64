@@ -109,7 +109,7 @@ that this CANN does not yet build for.
 
 **That separate image now exists, and it builds.** `targets/target-950pr/`
 targets a 950-class part on CANN **9.1.0** and x86_64, natively rather than
-under emulation; it builds air-gapped in ~87 minutes and verifies 10/10 on a
+under emulation; it builds air-gapped in ~95 minutes and verifies 10/10 on a
 build host. [docs/target-950pr-x86_64.md](target-950pr-x86_64.md) carries its
 release matrix, its staging plan, the probe evidence that 9.1.0 is the right
 line to pin, and its measured results;

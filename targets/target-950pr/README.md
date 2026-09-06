@@ -20,8 +20,8 @@ is the *how*.
 | Stack | CANN 9.1.0 + NNAL/ATB · torch 2.10.0+cpu · torch_npu 2.10.0.post4 · vLLM v0.27.1 · vllm-ascend `main` |
 | Payload | `deps/950pr-x86_64/` (override with `DEPS_DIR`) |
 | Build strategy | **native x86_64 compilation** — 27 ACLNN custom ops, 493 kernel binaries |
-| Cold build | ~87 min (kernel compilation is nearly all of it) |
-| Artefact | ~3.1 GB from a 12.8 GB image |
+| Cold build | **95 m 20 s** — 88 m 30 s of it is the kernel compile |
+| Artefact | 3,224,204,628 B (3.1 GB) from a 20-layer, 12.8 GB image |
 | Verify | **10/10** on a build host, 11/11 with an NPU |
 
 ---
@@ -161,7 +161,7 @@ dockerfile frontend may be fetched, and only when not already cached.
 | — | `cann_extra` copied into the toolkit's `lib64`; `libhccl.so` fallback wired via `common/patches/hccl_devlib_fallback.sh` |
 | 4 | environment (`ASCEND_TOOLKIT_HOME`, `ATB_HOME_PATH`, `LD_LIBRARY_PATH`, `SOC_VERSION`, `ASCEND_AICORE_ARCH=dav-v300`, …) |
 | 5 | torch stack, vLLM and the `vllm-ascend` dependency set in separate pip transactions, then a no-CUDA assertion |
-| 6 | `vllm-ascend` built for `ascend950dt_9582` and installed — **this is the 87 minutes** |
+| 6 | `vllm-ascend` built for `ascend950dt_9582` and installed — **this is the 88 minutes** |
 | 7 | driver plumbing (`HwHiAiUser`, `/var/driver`, `/usr/slog`) |
 | 8 | entrypoint + verify suite, then a build-time import assertion |
 
@@ -182,9 +182,11 @@ loaded. Check the process table, not the log:
 pgrep -c bisheng
 ```
 
-The last ~10 `MlaPrologV3_*` kernels alone account for roughly thirty minutes.
+The tail is badly skewed: kernels 1–480 finish in ~47 min, and the final 13 —
+dominated by `MlaPrologV3_*` — take ~44 min on their own, with single compiler
+processes alive for 14+ minutes.
 
-### Caching: how not to lose 87 minutes
+### Caching: how not to lose 88 minutes
 
 BuildKit keys a layer on the literal command string **plus its mounts**. Editing
 anything the stage-6 `RUN` references — including adding a `--mount` for a
