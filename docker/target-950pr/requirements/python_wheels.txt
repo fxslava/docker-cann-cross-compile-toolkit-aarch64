@@ -1,6 +1,11 @@
 # ---------------------------------------------------------------------------
-# The cp312 / manylinux x86_64 wheelhouse that deps/950pr-x86_64/python_wheels/
+# The cp310 / manylinux x86_64 wheelhouse that deps/950pr-x86_64/python_wheels/
 # must contain for Dockerfile.x86_64 to install with --no-index.
+#
+# cp310 because the base is Ubuntu 22.04 and jammy's system interpreter is
+# python3.10. Every pin below publishes a cp310 manylinux_2_28 x86_64 wheel and
+# vLLM 0.27.1 declares requires-python >=3.10,<3.15, so nothing is given up by
+# staying on the distribution's own interpreter.
 #
 # Every pin below is read out of vllm-project/vllm-ascend@main, not chosen
 # here: requirements.txt + pyproject.toml pin the torch stack, and
@@ -11,14 +16,24 @@
 #   upstream ref     vllm-ascend@main, Dockerfile.a5
 #   CANN             9.1.0
 #   base image there quay.io/ascend/cann:9.1.0-950-ubuntu22.04-py3.12
+#                    (Huawei also publishes -py3.10 and -py3.11 of that tag;
+#                    this image is the 3.10 line, on plain ubuntu:22.04)
 #
 # WHERE THESE COME FROM
 #   torch, torchvision, torchaudio  download.pytorch.org/whl/cpu
-#   torch-npu, triton-ascend        mirrors.huaweicloud.com/ascend/repos/pypi
-#                                   (NOT on PyPI: PyPI's newest torch-npu is
-#                                   2.9.1, and 2.10.0.post4 is Ascend-mirror
-#                                   only. This is the single most likely
-#                                   staging failure - see the docs.)
+#   torch-npu                       PyPI. This CORRECTS an earlier note in this
+#                                   repo claiming 2.10.0.post4 was Ascend-mirror
+#                                   only because PyPI stopped at 2.9.1; PyPI now
+#                                   carries 2.10.0, 2.10.0.post2, .post4 and
+#                                   .post6 with cp310-cp313 manylinux_2_28
+#                                   wheels for both x86_64 and aarch64.
+#   triton-ascend                   mirrors.huaweicloud.com/ascend/repos/pypi
+#                                   ONLY. PyPI's triton-ascend stops at 3.2.0;
+#                                   3.2.2 exists just on the Ascend mirror,
+#                                   whose index is served at the root of that
+#                                   path (no /simple/ prefix - requesting one
+#                                   404s). This is now the single most likely
+#                                   staging failure - see the docs.
 #   everything else                 PyPI
 #
 # vLLM IS DELIBERATELY ABSENT FROM THIS FILE.

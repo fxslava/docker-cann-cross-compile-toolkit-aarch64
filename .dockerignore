@@ -1,22 +1,28 @@
+# Build context for every image is the repository root; all Dockerfile paths are
+# repo-relative. Everything is excluded by default, re-included explicitly.
+#
+# The leading `*` is what keeps artifacts/ out. The context is hashed and
+# transferred on every build; the 950PR archive alone is 3.1 GB.
+# See docs/repository-layout.md.
 *
 
-# The build context for BOTH images is the repository root, so everything the
-# Dockerfiles read is repo-relative and only two trees are re-included here:
-# deps/ (the offline payload) and docker/ (the image assets).
-
-# --- offline payload: bind-mounted, never COPYed ---------------------------
-# deps/ carries the CANN .run, the AArch64 wheelhouse, the local apt archive
-# and the vllm-ascend source. It is mounted at build time, never copied, so it
-# costs no image layer.
+# Offline payload. Bind-mounted at build time, never COPYed.
 !deps
-# ...but not the parts no Dockerfile reads. The vLLM source is only needed
-# while provisioning builds its wheel, and .provision is scratch space.
+
+# Not read by any Dockerfile. The vLLM checkout exists only so provisioning can
+# build its wheel; .provision is scratch; src tarballs are delivery vehicles for
+# trees extracted beside them.
 deps/src/vllm
 deps/.provision
+deps/950pr-x86_64/src/vllm
+deps/950pr-x86_64/src/*.tar.gz
 
-# --- image assets ----------------------------------------------------------
-# docker/target-310p/     Dockerfile.aarch64 plus the package lists, patches,
-#                         entrypoint and verification script it mounts or COPYs
-# docker/builder-x86_64/  the cross-compilation Dockerfile plus the sysroot
-#                         assembly and verification scripts it COPYs
+# Image assets: Dockerfiles, entrypoints, verify suites, package lists,
+# constraints, container-side provisioning scripts.
 !docker
+
+# Final deployable archives. Redundant while `*` stands; explicit so a later
+# broad re-include cannot expose them.
+artifacts
+artifacts/**
+*.tar.gz

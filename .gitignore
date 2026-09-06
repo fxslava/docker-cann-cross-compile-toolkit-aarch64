@@ -1,13 +1,41 @@
-# Offline build artefacts. Everything under deps/ is provisioned by
-# provision_deps_aarch64.sh / download_deps.sh and is far too large for git
-# (CANN toolkit ~1.1 GB, AArch64 wheelhouse several GB).
+# ---------------------------------------------------------------------------
+# See docs/repository-layout.md for the canonical tree and the reasoning.
+# The short version: provisioned bytes are never committed, sources always are.
+# ---------------------------------------------------------------------------
+
+# --- offline staging payload -----------------------------------------------
+# Everything under deps/ is produced by provision_deps_*.sh / download_deps.sh
+# and is far too large for git: the CANN toolkit alone is 1.2 GB, and the
+# 950PR payload is 3.8 GB across the toolkit, NNAL, cann_extra, the local apt
+# archive and a cp310 wheelhouse. It is declared by docker/<target>/deps.manifest
+# and re-provisioned on demand, so nothing here is lost by not tracking it.
 deps/
 
-# Loose artefacts if download_deps.sh was pointed at the repo root.
+# Loose artefacts if a download script was pointed at the repository root.
 *.run
 *.whl
 *.tar
 
-# Exported images (docker save | gzip). Multi-GB, regenerated on demand.
+# --- final deployable archives ---------------------------------------------
+# artifacts/ holds exported images (docker save | pigz) and wheelhouse bundles
+# on the Windows workspace filesystem. Multi-GB and regenerated on demand, so
+# it is ignored twice over: by directory and by extension.
 artifacts/
 *.tar.gz
+
+# --- build output from plugin source trees ---------------------------------
+# csrc/ and src/ carry sources only. setup.py writes _version.py, _build_info.py,
+# build/, .deps/ and compiled extensions back into the tree it builds, which is
+# exactly why the Dockerfiles copy the checkout out of its read-only bind mount
+# first. None of that belongs in git.
+build/
+dist/
+*.egg-info/
+.deps/
+*.so
+*.o
+__pycache__/
+*.py[cod]
+
+# --- local scratch ---------------------------------------------------------
+*.log

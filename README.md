@@ -24,9 +24,10 @@ Self-contained, reproducible Docker build environment for cross-compiling Huawei
 │   │   ├── Dockerfile           # Multi-stage / BuildKit image recipe
 │   │   ├── assemble_sysroot.sh  # Extracts 170+ target AArch64 CANN libraries & driver stubs
 │   │   └── verify.sh            # 15-point automated verification suite
-│   └── target-310p/             # sibling image: native AArch64 inference (README.aarch64.md)
-├── deps/                        # offline payload: CANN .run files, wheels, debs (git-ignored)
-├── artifacts/                   # exported image tarballs (git-ignored)
+│   ├── target-310p/             # sibling image: native AArch64 inference (README.aarch64.md)
+│   └── target-950pr/            # sibling image: native x86_64 Ascend 950PR (docs/target-950pr-x86_64.md)
+├── deps/<target>/               # offline payload: CANN .run files, wheels, debs (git-ignored)
+├── artifacts/                   # final deployable archives, Windows drive (git-ignored)
 ├── download_deps.sh             # Idempotent downloader with SHA-256 integrity verification
 ├── .dockerignore                # Context exclusion to prevent image layer bloat
 ├── .gitattributes               # Enforces LF endings across all platforms
@@ -34,10 +35,17 @@ Self-contained, reproducible Docker build environment for cross-compiling Huawei
 
 ```
 
-The build context for **both** images is the repository root, and every path
-inside the two Dockerfiles is repo-relative. Always build with `-f`, never by
+The build context for **every** image is the repository root, and every path
+inside the Dockerfiles is repo-relative. Always build with `-f`, never by
 `cd`-ing into a Dockerfile's own directory — that would leave the `deps/`
 payload outside the context.
+
+**[docs/repository-layout.md](docs/repository-layout.md) is the authority on
+what belongs in each directory** and on the two rules that are easy to break by
+accident: `artifacts/` holds only final deployable archives, lives on the
+Windows workspace drive, and is kept out of both git and the Docker build
+context; `deps/` is provisioned, never committed, and declared per target by
+`docker/<target>/deps.manifest`.
 
 ---
 

@@ -56,7 +56,7 @@ targets:
 
   # -------------------------------------------------------------------------
   950pr-x86_64:
-    status: scaffolded, not yet built    # payload not staged; see the doc
+    status: built and verified           # 86m58s cold, 10/10 verify on a build host
     description: >-
       Native x86_64 offline inference image for Ascend 950PR (Atlas 350),
       DaVinci v3 / A5 device family. Host and target architecture are the same,
@@ -65,8 +65,12 @@ targets:
     build_script: build_950pr_x86_64.sh
     platform: linux/amd64
     emulated: false
-    base_image: ubuntu:24.04
-    python: "3.12"
+    # Jammy, matching upstream: Dockerfile.a5 builds on
+    # quay.io/ascend/cann:9.1.0-950-ubuntu22.04-py3.12, and Huawei publishes
+    # that tag for py3.{10,11,12}. This image is the 3.10 line, on plain
+    # ubuntu:22.04, so the wheelhouse is cp310.
+    base_image: ubuntu:22.04
+    python: "3.10"
     deps_dir: deps/950pr-x86_64
     deps_manifest: docker/target-950pr/deps.manifest
     soc:
@@ -85,22 +89,35 @@ targets:
       nnal: 9.1.0                      # ATB; sourced before the wheel build
       vllm: 0.27.1                     # built from source, VLLM_TARGET_DEVICE=empty
       vllm_ascend: main                # no tagged release carries the A5 gates yet
-      torch: 2.10.0
-      torch_npu: 2.10.0.post4          # Ascend mirror only, not on PyPI
-      torchvision: 0.25.0
-      triton_ascend: 3.2.2
+      # The +cpu local-version builds are mandatory, not cosmetic: PyPI's
+      # x86_64 torch 2.10.0 declares fifteen nvidia-*-cu12 requirements gated
+      # on platform_machine == "x86_64". See constraints.x86_64.txt.
+      torch: 2.10.0+cpu
+      torch_npu: 2.10.0.post4          # on PyPI (cp310-cp313, manylinux_2_28)
+      torchvision: 0.25.0+cpu
+      torchaudio: 2.10.0+cpu
+      triton_ascend: 3.2.2             # Ascend mirror only; PyPI stops at 3.2.0
+    constraints: docker/target-950pr/constraints.x86_64.txt
+    provision_script: provision_deps_950pr_x86_64.sh
     patches: []                        # none, by design
     operator_coverage:
-      # Upstream currently puts ascend950 on the same CMake branch as
-      # ascend310p, so this is a SUBSET, not the full DaVinci v3 set.
-      vllm_ascend_kernels: skipped
-      mla_preprocess: excluded
-      batch_matmul_transpose: excluded
+      # Two SEPARATE mechanisms, and only the first is gated off for ascend950.
+      # Measured from the built image, not inferred from the CMake gates.
+      vllm_ascend_kernels: skipped       # no libvllm_ascend_kernels.so
       atb_and_direct_kernels: not-defined
+      aclnn_custom_ops: 27               # csrc/build_aclnn.sh ascend950 branch
+      aclnn_kernel_binaries: 493
+      aclnn_installed_files: 793         # vllm_ascend/_cann_ops_custom/vendors
+      mla_prolog_v3: built               # MLAPO is NOT excluded on this SoC
       note: see docs/target-950pr-x86_64.md "Operator coverage"
     verify:
       script: docker/target-950pr/verify_runtime.sh
-      assertions_on_build_host: 9
+      assertions_on_build_host: 10       # 12 on a host with /dev/davinci*
+    results:
+      build_seconds: 5218                # 86m58s cold, ~87m of it kernel compile
+      image_content_size: 3.25GB
+      artifact_bytes: 3224198617
+      artifact_sha256: 1d4435a4170c488883ff2b64313df2f16ca9f85a604a026b7488d76b80e13546
     artifact: artifacts/vllm-ascend-950pr-x86_64-offline.tar.gz
 
 builders:

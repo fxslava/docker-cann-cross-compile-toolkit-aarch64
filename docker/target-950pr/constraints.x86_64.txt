@@ -1,0 +1,34 @@
+# ---------------------------------------------------------------------------
+# pip constraints applied to EVERY resolve, both when the wheelhouse is
+# downloaded and when the image installs from it.
+#
+# WHY THIS FILE EXISTS
+# PyPI's x86_64 torch 2.10.0 is a CUDA build: its metadata carries FIFTEEN
+# nvidia-*-cu12 requirements gated on
+# `platform_system == "Linux" and platform_machine == "x86_64"`, which is
+# exactly this target. An unconstrained resolve therefore drags several GB of
+# CUDA runtime into the wheelhouse -- none of which an Ascend NPU can use, and
+# which would also shadow the CPU build torch_npu is compiled against.
+#
+# This is the same trap the 310P hit from the other side (there the aarch64
+# PyPI wheels are CUDA builds for GH200/Jetson); see
+# docker/target-310p/constraints.aarch64.txt.
+#
+# Pinning the "+cpu" local-version builds from download.pytorch.org keeps the
+# resolve on the CPU wheels, which declare no nvidia requirements at all. PyPI
+# publishes no +cpu variants, so the pin is unambiguous.
+#
+# THE VERSIONS ARE NOT ARBITRARY
+# torch 2.10.0 / torch_npu 2.10.0.post4 / torchvision 0.25.0 is the stack
+# upstream's Dockerfile.a5 builds its 950/A5 image against, paired with
+# CANN 9.1.0. See docker/target-950pr/requirements/python_wheels.txt.
+#
+# All three exist as cp310 manylinux_2_28 x86_64 wheels on the CPU index, so
+# nothing here forces a newer interpreter than jammy's python3.10.
+#
+# These are constraints, not requirements: they cap what may be chosen, they do
+# not install anything on their own.
+# ---------------------------------------------------------------------------
+torch==2.10.0+cpu
+torchvision==0.25.0+cpu
+torchaudio==2.10.0+cpu

@@ -3,11 +3,16 @@
 A `linux/amd64` offline inference image for Ascend 950-class silicon (Atlas
 350, DaVinci v3, device family **A5**), built natively on an x86_64 host.
 
-**Status: scaffolded, not yet built.** Every file is in place and every path is
-wired, but `deps/950pr-x86_64/` has not been staged — that is a multi-gigabyte
-networked step, and §4 below is the plan for it. `build_950pr_x86_64.sh`
-refuses to start until the manifest is satisfied, so nothing here can be
-mistaken for a working image.
+**Status: built and verified.** `deps/950pr-x86_64/` was staged in full (3.8 GB)
+and the image was built natively on x86_64 with `--network=none`, then verified
+inside the container: **10/10 checks pass on a build host**, with the
+hardware-only checks reported as `[INFO]` rather than counted. See §7 for the
+measured numbers and §5 for what the operator set actually turned out to be.
+
+Building it exposed six things that the scaffold had assumed away, all of them
+now fixed in this repo rather than worked around locally — the most consequential
+being that **the publicly downloadable CANN 9.1.0 toolkit is not a complete CANN
+install** (§6).
 
 This is the sibling of the 310P image in [README.aarch64.md](../README.aarch64.md).
 The two differ in more than the SoC:
@@ -15,7 +20,7 @@ The two differ in more than the SoC:
 | | 310P3 (`docker/target-310p`) | 950PR (`docker/target-950pr`) |
 |---|---|---|
 | Image architecture | `linux/arm64`, QEMU-emulated at build time | `linux/amd64`, **native** |
-| Base OS / Python | Ubuntu 22.04 / 3.10 | Ubuntu 24.04 / 3.12 |
+| Base OS / Python | Ubuntu 22.04 / 3.10 | Ubuntu 22.04 / 3.10 |
 | CANN | 8.5.0 | 9.1.0 (+ NNAL/ATB) |
 | Unpacker stage | needed, to dodge the emulation tax | **none** — installer runs natively |
 | `ldconfig` stub | needed, `qemu-user` segfaults | **none** |
@@ -68,24 +73,56 @@ Read out of `vllm-ascend@main` (`requirements.txt`, `pyproject.toml`) and its
 |---|---|---|
 | CANN | 9.1.0 | Huawei OBS bucket |
 | CANN NNAL (ATB) | 9.1.0 | same bucket |
-| Python | 3.12 | noble system interpreter |
+| Python | 3.10 | jammy system interpreter |
 | vLLM | v0.27.1 | **built from source**, `VLLM_TARGET_DEVICE=empty` |
 | vllm-ascend | `main` | no tagged release carries the A5 gates yet |
-| torch | 2.10.0 | download.pytorch.org/whl/cpu |
-| torch_npu | 2.10.0.post4 | **Ascend mirror only** |
-| torchvision / torchaudio | 0.25.0 / 2.10.0 | download.pytorch.org |
-| triton-ascend | 3.2.2 | Ascend mirror; needs clang-15 |
+| torch | 2.10.0**+cpu** | download.pytorch.org/whl/cpu |
+| torch_npu | 2.10.0.post4 | PyPI |
+| torchvision / torchaudio | 0.25.0+cpu / 2.10.0+cpu | download.pytorch.org/whl/cpu |
+| triton-ascend | 3.2.2 | **Ascend mirror only**; needs clang-15 |
 
-Two traps worth stating plainly:
+Three traps worth stating plainly:
 
 * **PyPI's x86_64 `vllm` wheel is a CUDA build.** On aarch64 this was already
   true; on x86_64 pip will resolve it happily and produce an image that imports
   cleanly and dispatches to nothing. The wheel must be built from the v0.27.1
   source with `VLLM_TARGET_DEVICE=empty`.
-* **torch_npu 2.10.0.post4 is not on PyPI.** PyPI's newest `torch-npu` is
-  2.9.1. 2.10.0.post4 lives on `mirrors.huaweicloud.com/ascend/repos/pypi`. If
-  that mirror is unreachable, the fallback is the 2.9.1 + matching
-  vllm-ascend/vLLM set — a *different* matrix, not a substitution into this one.
+
+  Building it that way does more than skip the CUDA kernels. `setup.py`'s
+  `get_requirements()` reads `requirements/common.txt` for the empty target
+  (`_no_device()`), and `common.txt` names **no** `torch`, `nvidia` or `cuda`
+  requirement at all — whereas the published sdist's `PKG-INFO`, generated for
+  the CUDA target, declares `torch==2.13.0`, `torchvision==0.28.0` and
+  `torchaudio==2.11.0`. Installing the PyPI artefact would therefore not merely
+  add CUDA: it would drag the torch stack **three minor versions past** the
+  2.10.0 that `torch_npu` 2.10.0.post4 is compiled against. The empty-target
+  wheel stays silent about torch and lets vllm-ascend's pins govern, which is
+  what makes the three-transaction install order work. The wheel it produces is
+  versioned `0.27.1+empty` — `setup.py` appends that local segment itself.
+* **PyPI's x86_64 `torch` 2.10.0 is a CUDA build too**, and this one bites
+  harder because nothing about it looks wrong. Its metadata carries **fifteen**
+  `nvidia-*-cu12` requirements gated on
+  `platform_system == "Linux" and platform_machine == "x86_64"` — exactly this
+  target — so an unconstrained resolve stages several GB of CUDA runtime that
+  an Ascend NPU cannot use, and whose `torch` shadows the CPU build `torch_npu`
+  is compiled against. `docker/target-950pr/constraints.x86_64.txt` pins
+  `torch==2.10.0+cpu` (plus `torchvision`/`torchaudio` `+cpu`), which declare no
+  `nvidia` requirements at all. This is the same mechanism, against the
+  opposite architecture, as `docker/target-310p/constraints.aarch64.txt`.
+  Three places enforce it, so a slip cannot reach the image quietly:
+  `fetch_wheels.sh` fails the resolve, `build_950pr_x86_64.sh` fails preflight,
+  and the Dockerfile asserts no `nvidia-*` distribution is installed and that
+  `torch.__version__` ends in `+cpu`.
+* **triton-ascend 3.2.2 is Ascend-mirror only.** PyPI stops at 3.2.0. 3.2.2
+  lives on `mirrors.huaweicloud.com/ascend/repos/pypi`, whose PEP 503 index is
+  served at the **root** of that path — appending `/simple/` returns 404. If the
+  mirror is unreachable, `fetch_wheels.sh` records the miss in
+  `python_wheels/.optional-missing` rather than failing the whole resolve.
+
+An earlier revision of this document claimed `torch_npu` 2.10.0.post4 was
+Ascend-mirror-only because PyPI stopped at 2.9.1. That is no longer true and the
+table above is corrected: PyPI now carries 2.10.0, `.post2`, `.post4` and
+`.post6` as cp310–cp313 `manylinux_2_28` wheels for x86_64 and aarch64.
 
 ---
 
@@ -113,7 +150,7 @@ docker buildx build \
 
 | ARG | Default | Notes |
 |---|---|---|
-| `BASE_IMAGE` | `ubuntu:24.04` | see §6 on the noble deviation |
+| `BASE_IMAGE` | `ubuntu:22.04` | jammy, the base upstream builds on — see §6 |
 | `CANN_VERSION` | `9.1.0` | selects both `.run` filenames |
 | `SOC_VERSION` | `ascend950dt_9582` | **lowercase, see below** |
 | `ASCEND_AICORE_ARCH` | `dav-v300` | **unverified, see §6** |
@@ -179,9 +216,33 @@ deps/950pr-x86_64/
   Ascend-cann-toolkit_9.1.0_linux-x86_64.run     1,298,337,341 bytes
   Ascend-cann-nnal_9.1.0_linux-x86_64.run          572,750,476 bytes
   apt_debs/                 .deb closure of packages/sys_packages.txt + Packages.gz
-  python_wheels/            cp312 manylinux x86_64 wheelhouse
+  python_wheels/            cp310 manylinux x86_64 wheelhouse (no CUDA, see §2)
   src/vllm-ascend/          upstream checkout, no patches applied
+  src/vllm/                 v0.27.1, built to a wheel and left in python_wheels/
 ```
+
+### The scripted route
+
+`provision_deps_950pr_x86_64.sh` does all of it, and is the sibling of
+`provision_deps_aarch64.sh` — minus the QEMU, because host and target are the
+same architecture here, so every container runs natively and resolves against
+the real target environment instead of an emulated one:
+
+```bash
+./provision_deps_950pr_x86_64.sh                 # everything that is missing
+./provision_deps_950pr_x86_64.sh cann            # or one stage at a time:
+./provision_deps_950pr_x86_64.sh src debs vllm wheels verify
+```
+
+Stages are idempotent and resumable — re-running skips what is already
+complete, and the CANN fetch picks up mid-file. That last part is deliberate:
+`curl --retry` combined with `-C -` restarted the 1.3 GB toolkit from byte 0 on
+the first dropped connection *and truncated what was already on disk*, so each
+attempt is instead a fresh `curl` resuming from the current file size, with
+`--speed-limit`/`--speed-time` to drop a connection that has gone quiet.
+
+The manual equivalent of each stage follows, for when something needs doing by
+hand.
 
 **1. CANN installers**
 
@@ -192,13 +253,15 @@ wget -c "$BASE/Ascend-cann-nnal_9.1.0_linux-x86_64.run"
 sha256sum Ascend-cann-*_9.1.0_linux-x86_64.run   # pin these into deps.manifest
 ```
 
-**2. apt archive.** Native this time — no QEMU container needed, just a noble
-one so the `.deb`s match the base image:
+**2. apt archive.** Native this time — no QEMU container needed, just a jammy
+one so the `.deb`s match the base image. `clang-15` resolves out of
+`jammy-updates` (1:15.0.7-0ubuntu0.22.04.3), which stock `ubuntu:22.04` has
+enabled; it is not in the release pocket:
 
 ```bash
 docker run --rm -v "$PWD/deps/950pr-x86_64/apt_debs:/out" \
   -v "$PWD/docker/target-950pr/packages/sys_packages.txt:/pkgs.txt:ro" \
-  ubuntu:24.04 bash -c '
+  ubuntu:22.04 bash -c '
     apt-get update -qq &&
     apt-get install -y --no-install-recommends --download-only \
       $(grep -vE "^[[:space:]]*(#|$)" /pkgs.txt | tr "\n" " ") &&
@@ -207,14 +270,26 @@ docker run --rm -v "$PWD/deps/950pr-x86_64/apt_debs:/out" \
     dpkg-scanpackages . > Packages && gzip -kf Packages'
 ```
 
-**3. wheelhouse.** Resolve as cp312/x86_64, with the Ascend mirror as an extra
-index for `torch-npu` and `triton-ascend`:
+**3. wheelhouse.** Resolve as cp310/x86_64 — inside an `ubuntu:22.04`
+container, so environment markers (`python_version`, `platform_machine`, glibc)
+are evaluated against the real target rather than the host. `--constraint` is
+the load-bearing flag, not an optional tidy-up: without it this exact command
+stages several GB of `nvidia-*-cu12` wheels (see §2).
 
 ```bash
 pip download --only-binary=:all: -d deps/950pr-x86_64/python_wheels \
   -r docker/target-950pr/requirements/python_wheels.txt \
+  --constraint docker/target-950pr/constraints.x86_64.txt \
   --extra-index-url https://download.pytorch.org/whl/cpu \
   --extra-index-url https://mirrors.huaweicloud.com/ascend/repos/pypi
+```
+
+Then confirm the payload is CUDA-free before building — `build_950pr_x86_64.sh`
+checks this in preflight and refuses to start otherwise:
+
+```bash
+find deps/950pr-x86_64 -type f \( -iname 'nvidia_*' -o -iname '*cudnn*' \) | sort
+ls deps/950pr-x86_64/python_wheels/torch-*.whl     # must be torch-2.10.0+cpu-*
 ```
 
 **4. the vLLM wheel** — built, never downloaded:
@@ -236,12 +311,36 @@ git clone --depth 1 https://github.com/vllm-project/vllm-ascend.git \
 
 ---
 
-## 5. Operator coverage — read before believing a PASS
+## 5. Operator coverage — corrected by the build
 
-The 950 operator set produced by this image is **a subset of DaVinci v3's
-capability, not the full set**, because that is what upstream currently builds.
-`vllm-ascend@main` puts `ascend950` on the *same* CMake branch as `ascend310p`
-in three places:
+**An earlier revision of this section was wrong, and the build disproved it.**
+It claimed the 950 gets no custom kernels at all. That conflated two separate
+mechanisms:
+
+| Mechanism | ascend950 | Evidence |
+|---|---|---|
+| `ascendc_library(vllm_ascend_kernels)` | **skipped** | no `libvllm_ascend_kernels.so` in the image |
+| `csrc/build_aclnn.sh` ACLNN ops | **27 ops built** | 493 kernel binaries, 793 files installed |
+
+So the CMake gate quoted below is real, but it only governs the *kernels
+library*. The ACLNN custom-op package is built by a different path and is by
+far the largest product of this image — roughly **87 minutes** of the build,
+installed at `vllm_ascend/_cann_ops_custom/vendors/custom_transformer` with
+`libcust_opapi.so` alongside it. `verify_runtime.sh` now asserts its presence.
+
+`mla_prolog_v3` is among the 27, so **MLAPO is not excluded on this SoC** — the
+`MlaPrologV3_*` kernels are among the slowest to compile in the whole run. The
+ops actually built are listed in `build_aclnn.sh`'s `ascend950` branch:
+`moe_gating_top_k_hash`, `inplace_partial_rotary_mul`, `kv_compress_epilog`,
+`compressor`, `vllm_quant_lightning_indexer`, `kv_quant_sparse_attn_sharedkv`,
+`swiglu_group_quant`, `situ_mx_quant`, `causal_conv1d`,
+`recurrent_gated_delta_rule`, `recurrent_kda`, `chunk_fwd_o`,
+`chunk_gated_delta_rule_fwd_h`, `chunk_kda_fwd`, `kda_gate_cumsum`,
+`store_kv_block`, `k2q_csr`, `sparse_attention_score`, `mla_prolog_v3` and
+others.
+
+What remains true is that the **`vllm_ascend_C` extension** takes the same
+branch as the 310P, and that is what the gates below describe:
 
 ```cmake
 if(SOC_VERSION MATCHES "ascend310p.*|ascend950")   # skip the whole kernels lib
@@ -255,19 +354,14 @@ if(NOT (SOC_VERSION MATCHES "ascend310p.*|ascend950"))
     target_compile_definitions(vllm_ascend_C PRIVATE -DVLLM_ENABLE_ATB_AND_DIRECT_KERNELS)
 ```
 
-and `vllm_ascend/utils.py` says it outright: *"in ASCEND950 chip, we temporarily
-disable all custom ops"*. Only `vllm_ascend_C` is installed; there is no
-`libvllm_ascend_kernels.so`.
+and `vllm_ascend/utils.py` still says *"in ASCEND950 chip, we temporarily
+disable all custom ops"* — a comment that now describes only the
+`vllm_ascend_C` op list, not the ACLNN package the same tree builds.
 
-So a request for "the full operator set — FlashAttention, MLA, FP8, MXFP4/FP4"
-cannot be satisfied by building upstream today, and an image claiming it would
-be claiming something untrue. `verify_runtime.sh` therefore asserts the shape
-upstream actually produces and prints the exclusions as `[INFO]`. When upstream
-enables those kernels, step 6 of the suite and the stage 6 note in the
-Dockerfile have to move together — deliberately, not silently.
-
-What *is* asserted: no 310P stub symbols leaked in, `vllm_ascend_C` links with
-no unresolved non-Python symbols, and the device family is `A5`.
+`verify_runtime.sh` asserts the shape upstream actually produces: no 310P stub
+symbols leaked in, `vllm_ascend_C` links with no unresolved non-Python symbols,
+the device family is `A5`, and the ACLNN custom-op package is installed. It does
+**not** claim those operators execute correctly — only a 950 can show that.
 
 ---
 
@@ -279,14 +373,57 @@ each for a reason that would otherwise cause a silent failure:
 1. **`SOC_VERSION=Ascend950PR` → `ascend950dt_9582`.** Case-sensitive CMake
    gates; §3 above.
 2. **"Full operator set" → upstream's subset.** §5 above.
-3. **Ubuntu 24.04 / Python 3.12 is unreferenced upstream.** Huawei publishes
-   950 images only on `ubuntu22.04` and `openeuler24.03`, and upstream's
-   `Dockerfile.a5` builds on the 22.04 one. Noble was requested and is
-   implemented, but nothing upstream exercises this combination: expect the
-   `.run` installer's distro checks and the glibc 2.39 jump to be where trouble
-   appears first. Fallback is one flag —
-   `BASE_IMAGE=ubuntu:22.04 ./build_950pr_x86_64.sh` — with `python3.10` in
-   `packages/sys_packages.txt` and a cp310 wheelhouse.
+3. ~~**Ubuntu 24.04 / Python 3.12 is unreferenced upstream.**~~ **Resolved:
+   this target is now Ubuntu 22.04 / Python 3.10.** The earlier revision built
+   on noble and recorded the risk that nothing upstream exercised that
+   combination, with the fallback spelled out as "one flag —
+   `BASE_IMAGE=ubuntu:22.04`, with `python3.10` in `packages/sys_packages.txt`
+   and a cp310 wheelhouse". That fallback is now the default, so the deviation
+   is gone rather than merely documented:
+
+   * Huawei publishes 950 CANN images for `ubuntu22.04` only (plus
+     `openeuler24.03`), including `9.1.0-950-ubuntu22.04-py3.{10,11,12}`, and
+     upstream's `Dockerfile.a5` builds on the 22.04 one.
+   * Jammy's glibc is 2.35, comfortably above the `manylinux_2_28` floor every
+     wheel in this stack targets. Noble's 2.39 was the untested jump.
+   * The cp310 matrix is complete, not a compromise: `torch` 2.10.0+cpu,
+     `torch_npu` 2.10.0.post4, `torchvision` 0.25.0+cpu, `torchaudio`
+     2.10.0+cpu and `triton-ascend` 3.2.2 all publish cp310 `manylinux_2_28`
+     x86_64 wheels, and vLLM 0.27.1 declares `requires-python >=3.10,<3.15`.
+   * `BASE_IMAGE` remains an ARG, so noble is still reachable with one flag —
+     the direction of the fallback has simply reversed.
+
+   Verified in an `ubuntu:22.04` container rather than assumed: Python 3.10.12,
+   glibc 2.35, `clang-15` at 1:15.0.7-0ubuntu0.22.04.3 from `jammy-updates`,
+   and `python3-distutils` available (Python 3.10 still needs it; 3.12 does
+   not, which is why it was absent from the noble-era package list).
+
+4. **The public CANN 9.1.0 toolkit is not a complete CANN install**, and this
+   was the hardest thing the build surfaced. Its `lib64` holds **150** shared
+   objects; the `lib64` in Huawei's own image for this SoC
+   (`quay.io/ascend/cann:9.1.0-950-ubuntu22.04-py3.10`) holds **176**. Three of
+   the twenty-six missing ones stop the build dead:
+
+   | Library | Needed by | Symptom if absent |
+   |---|---|---|
+   | `libopapi.so` | `vllm_ascend_C` links `-lopapi` for **every** SoC | `ld: cannot find -lopapi` |
+   | `libopapi_math.so` | `libcust_opapi.so` in the custom-op package | installer: *"Shared library validation failed"* |
+   | `libhccl.so` | `torch_npu`'s `DT_NEEDED` | `ImportError: libhccl.so` |
+
+   None are separately downloadable: `Ascend-cann-kernels-{950,a5,910b}_9.1.0_*`
+   and `-nnrt_9.1.0_*` all return **403** while the toolkit and NNAL return
+   **206**. They are therefore lifted out of the vendor image's layer blob into
+   `deps/950pr-x86_64/cann_extra/` (183 MB, 26 libraries) — the same route the
+   310P used to obtain `libhccl.so` on CANN 8.5.0.
+
+   `provision_deps_950pr_x86_64.sh cann_extra` does this without a `docker
+   pull`: it resolves the amd64 manifest, fetches the 4.41 GB layer with the
+   same parallel range-request downloader used for the CANN `.run` files
+   (~70 s at ~20 MB/s), and extracts only the missing `.so` files.
+
+   The toolkit's own manifest confirms the omission is deliberate rather than a
+   broken install: `share/info/hcomm/script/filelist.csv` lists
+   `libhccl_{alg,legacy,plf,v2}.so` and `libhcomm.so` and no aggregate.
 
 Unverified, and honestly so:
 
@@ -303,10 +440,63 @@ Unverified, and honestly so:
 
   `build_950pr_x86_64.sh` runs that check automatically when it finds an
   extracted toolkit under the payload directory, and says so when it cannot.
-* **PEP 668 handling.** Noble marks its interpreter externally managed; the
-  Dockerfile removes `/usr/lib/python3.12/EXTERNALLY-MANAGED` because the CANN
-  installer shells out to the system `pip3` for its `--pylocal` components. A
-  venv would be tidier but does not survive that.
+* ~~**PEP 668 handling.**~~ **No longer a concern on this base.** Jammy ships
+  no `/usr/lib/python3.10/EXTERNALLY-MANAGED` marker (checked in the
+  container), so pip installs into the system interpreter unmodified — which is
+  what the CANN installer needs, since it shells out to the system `pip3` for
+  its `--pylocal` components and would not see a venv. The Dockerfile keeps a
+  no-op `rm -f /usr/lib/python3.*/EXTERNALLY-MANAGED` purely so that overriding
+  `BASE_IMAGE` with a marker-carrying release does not silently break.
 * **Whether `9.1.0`'s toolkit really carries the x86_64 `--pylocal` payload the
-  installer expects on noble.** The 310P path proved this only for aarch64
-  payloads on a 22.04 base.
+  installer expects.** The 310P path proved this only for aarch64 payloads,
+  though both land on a 22.04 base now, which narrows the gap to architecture
+  alone.
+
+---
+
+## 7. Measured results
+
+Built natively on x86_64 (12 cores, WSL2) with `--network=none`, from a payload
+staged by `provision_deps_950pr_x86_64.sh`.
+
+| | |
+|---|---|
+| Base image | `ubuntu:22.04` (jammy), Python 3.10.12, glibc 2.35 |
+| Build time | **86m 58s** cold (kernel compilation is ~87m of it) |
+| Image | 3.25 GB content / 12.8 GB disk usage |
+| Artefact | `<project_root>/artifacts/vllm-ascend-950pr-x86_64-offline.tar.gz` on the **Windows** drive — see [repository-layout.md](repository-layout.md) |
+| Artefact size | **3,224,198,617 bytes** (3.1 GB), `docker save \| pigz` |
+| Artefact SHA-256 | `1d4435a4170c488883ff2b64313df2f16ca9f85a604a026b7488d76b80e13546` |
+| Payload | 3.8 GB in `deps/950pr-x86_64/` |
+| Verification | **10/10 passed, 0 failed** on a build host |
+
+Stack as built, confirmed from inside the image:
+
+```
+torch 2.10.0+cpu   torch_npu 2.10.0.post4   vllm 0.27.1   vllm_ascend A5
+triton-ascend 3.2.2 (provides the `triton` module; NVIDIA triton uninstalled)
+CANN 9.1.0 toolkit + NNAL/ATB + 26 cann_extra libraries
+ACLNN custom ops: 27 ops, 493 kernel binaries, 793 files installed
+vllm_ascend_C: 118 exported symbols, no unresolved non-Python symbols
+```
+
+**Zero NVIDIA artefacts**, enforced at four independent points: the constraint
+file, the wheelhouse resolve, `build_950pr_x86_64.sh` preflight, and an
+in-image assertion that no `nvidia-*` distribution is installed and that
+`torch.__version__` ends in `+cpu`.
+
+### What 10/10 does and does not mean
+
+Two checks are reported as `[INFO]` because they need silicon, exactly as the
+suite's contract requires — they are not silently passed:
+
+* **`vllm_ascend_C` cannot be imported here.** With no NPU, CANN's
+  `aclrtGetSocName()` returns NULL and the runtime aborts the process before
+  Python can catch it.
+* **`vllm serve --help` cannot run here.** It loads the platform plugin, which
+  imports triton-ascend, whose driver queries the NPU architecture at import:
+  `SystemError: <built-in function get_arch> returned NULL`.
+
+So this image is proven *complete and self-consistent offline*. Proving the
+operators **execute** requires a 950; re-run `verify` there and the suite
+exercises both checks and reports 12/12.

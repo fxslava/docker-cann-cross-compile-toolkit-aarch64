@@ -12,11 +12,16 @@
 #   DEPS_DIR    offline payload  (default $CONTEXT/deps/950pr-x86_64)
 #   TARGET_DIR  image assets     (default $CONTEXT/docker/target-950pr)
 #   SOC_VERSION build SoC        (default ascend950dt_9582)
-#   BASE_IMAGE  base             (default ubuntu:24.04)
+#   BASE_IMAGE  base             (default ubuntu:22.04)
 #
 # UNLIKE build_aarch64.sh THERE IS NO QEMU HERE. Host and target are both
 # x86_64, so there is no binfmt registration, no emulation tax and no
 # host-architecture unpacker stage - the CANN installer runs natively.
+#
+# The base is Ubuntu 22.04: jammy is what upstream's Dockerfile.a5 builds on
+# (via quay.io/ascend/cann:9.1.0-950-ubuntu22.04-py3.12) and the only Ubuntu
+# line Huawei ships 950 CANN images for. Its interpreter is python3.10, so the
+# staged wheelhouse must be cp310.
 #
 # The RUN steps execute with --network=none, so a successful build is itself
 # the proof that the payload is complete. Only the base image and the BuildKit
@@ -28,7 +33,7 @@ CONTEXT="${CONTEXT:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
 DEPS_DIR="${DEPS_DIR:-$CONTEXT/deps/950pr-x86_64}"
 TARGET_DIR="${TARGET_DIR:-$CONTEXT/docker/target-950pr}"
 TAG="${TAG:-vllm-ascend-950pr:x86_64-offline}"
-BASE_IMAGE="${BASE_IMAGE:-ubuntu:24.04}"
+BASE_IMAGE="${BASE_IMAGE:-ubuntu:22.04}"
 SOC_VERSION="${SOC_VERSION:-ascend950dt_9582}"
 CANN_VERSION="${CANN_VERSION:-9.1.0}"
 
@@ -124,6 +129,42 @@ if [ "${#missing[@]}" -gt 0 ]; then
     exit 1
 fi
 echo "  deps     : $(du -sh "$DEPS_DIR" | cut -f1) in $DEPS_DIR (manifest satisfied)"
+
+# --- CUDA gate: no NVIDIA wheels may enter an Ascend image ------------------
+# PyPI's x86_64 torch 2.10.0 declares fifteen nvidia-*-cu12 requirements gated
+# on `platform_machine == "x86_64"`, so any resolve that escaped
+# docker/target-950pr/constraints.x86_64.txt leaves them here. None of it is
+# usable on an Ascend NPU, it adds gigabytes to the image, and a CUDA torch
+# shadows the CPU build torch_npu is compiled against.
+#
+# The wheelhouse is checked before the build starts rather than after, because
+# --network=none means whatever is staged is exactly what gets installed.
+# Only wheels are inspected. Matching every file matched thirty Helion
+# autotuning configs in the vLLM source tree (vllm/kernels/helion/configs/
+# .../nvidia_h100.json and friends) - JSON named after the GPU it was tuned on,
+# not CUDA code, and not even in the build context. A CUDA *wheel* is the thing
+# that could actually be installed, so that is what is checked.
+cuda_artefacts=$(find "$DEPS_DIR" -type f -name '*.whl' \
+    \( -iname 'nvidia_*' -o -iname 'nvidia-*' \
+       -o -iname '*cudnn*' -o -iname '*cublas*' \) | sort)
+if [ -n "$cuda_artefacts" ]; then
+    echo "ERROR: NVIDIA/CUDA artefacts staged in $DEPS_DIR" >&2
+    echo "$cuda_artefacts" | sed 's/^/  - /' >&2
+    echo >&2
+    echo "  An Ascend payload must contain none. Re-stage the wheelhouse with" >&2
+    echo "  ./provision_deps_950pr_x86_64.sh wheels, which applies" >&2
+    echo "  $TARGET_DIR/constraints.x86_64.txt (torch==2.10.0+cpu)." >&2
+    exit 1
+fi
+
+torch_whl=$(ls "$DEPS_DIR"/python_wheels/torch-*.whl 2>/dev/null | head -1 || true)
+case "$(basename "${torch_whl:-none}")" in
+    torch-*+cpu-*) echo "  cuda gate: clean; torch is $(basename "$torch_whl")" ;;
+    none)          die "no torch wheel in $DEPS_DIR/python_wheels" ;;
+    *)             die "torch wheel is not a +cpu build: $(basename "$torch_whl").
+       PyPI's x86_64 torch is a CUDA build; stage the +cpu wheel from
+       https://download.pytorch.org/whl/cpu instead." ;;
+esac
 
 # The AI Core arch string is the one value here this repo has never verified
 # against a real CANN 9.x payload. If the toolkit has been extracted next to

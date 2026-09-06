@@ -1,20 +1,29 @@
 # ---------------------------------------------------------------------------
-# Ubuntu 24.04 (noble, amd64) packages that Dockerfile.x86_64 installs from the
+# Ubuntu 22.04 (jammy, amd64) packages that Dockerfile.x86_64 installs from the
 # local apt archive in deps/950pr-x86_64/apt_debs/.
 #
 # Read by BOTH the provisioning step (to download the .deb closure) and
 # Dockerfile.x86_64 (to install it), so the two can never drift. Same contract
 # as docker/target-310p/packages.aarch64.txt.
 #
+# Jammy, not noble, because jammy is the base upstream's Dockerfile.a5 actually
+# builds on and the only Ubuntu line Huawei publishes 950 CANN images for. Its
+# system interpreter is python3.10, so the wheelhouse is cp310.
+#
 # Differences from the 310P list, and why:
-#   * python3.12 rather than python3.10 - noble's system interpreter, and the
-#     version upstream's 950 images use (quay.io/ascend/cann:9.1.0-950-*-py3.12).
 #   * clang-15 - triton-ascend 3.2.2 needs it; upstream's Dockerfile.a5 installs
-#     it and wires up update-alternatives. Harmless if triton-ascend is dropped.
+#     it and wires up update-alternatives. Jammy carries it in jammy-updates
+#     (1:15.0.7-0ubuntu0.22.04.3), NOT in the release pocket, so the staging
+#     container must have jammy-updates enabled - the stock ubuntu:22.04 image
+#     does. Harmless if triton-ascend is dropped.
 #   * libibverbs-dev, libhiredis-dev - Mooncake transfer engine, which upstream
 #     builds into its A5 image. Kept so the offline archive can serve that build
 #     too; neither is needed for a plain `vllm serve`.
-#   * no python3-distutils - removed from Python 3.12; setuptools provides it.
+#   * python3-distutils - present here and absent from the noble-era list:
+#     Python 3.10 still needs it, and setuptools does not stand in for it the
+#     way it does on 3.12.
+#   * python3 resolves to 3.10 on this base, where the 310P list also gets 3.10
+#     - the two images share an interpreter version, not an architecture.
 # ---------------------------------------------------------------------------
 build-essential
 gcc
@@ -28,6 +37,7 @@ python3
 python3-dev
 python3-pip
 python3-venv
+python3-distutils
 clang-15
 patchelf
 protobuf-compiler

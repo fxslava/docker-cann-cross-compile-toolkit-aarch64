@@ -9,7 +9,7 @@
 # docker/target-310p/verify_runtime.sh:
 #
 #   1 x86_64 architecture
-#   2 Python 3.11 / 3.12
+#   2 Python 3.10 / 3.11 / 3.12
 #   3 CANN 9.x runtime libraries: libascendcl.so (x86-64 ELF) and libhccl.so
 #   4 offline torch / torch_npu / vllm / vllm_ascend imports
 #   5 vllm_ascend built for device family A5, not _310P
@@ -28,6 +28,19 @@
 # Exits non-zero if any check fails.
 # ---------------------------------------------------------------------------
 set -uo pipefail
+
+# QUIET vLLM's PLUGIN LOGGING, because this suite captures command substitution
+# output as values. vllm_ascend registers a platform plugin and vLLM announces
+# it on STDOUT, not stderr:
+#     INFO ... Available plugins for group vllm.platform_plugins:
+#     INFO ... Platform plugin ascend is activated
+# so `dt=$(python3 -c "... print(_build_info.__device_type__)")` came back as
+# five log lines with "A5" on the end and the check failed against a healthy
+# image, reporting 'built for INFO ... A5' instead of 'A5'. Every value probe
+# below therefore also takes the LAST line only - belt and braces, since a
+# future vLLM may log something this variable does not suppress.
+export VLLM_LOGGING_LEVEL="${VLLM_LOGGING_LEVEL:-ERROR}"
+
 PASS=0; FAIL=0
 ok()   { echo "  [ OK ] $*"; PASS=$((PASS+1)); }
 bad()  { echo "  [FAIL] $*"; FAIL=$((FAIL+1)); }
@@ -46,9 +59,12 @@ arch=$(uname -m)
 [ "$arch" = "x86_64" ] && ok "architecture: $arch" || bad "architecture is $arch, expected x86_64"
 
 pyv=$(python3 -c 'import sys; print("%d.%d" % sys.version_info[:2])' 2>/dev/null)
+# 3.10 is this image's own interpreter: the base is Ubuntu 22.04, matching
+# upstream's Dockerfile.a5 line, and jammy's system python is 3.10. 3.11 and
+# 3.12 stay acceptable so a BASE_IMAGE override does not fail a healthy image.
 case "$pyv" in
-    3.11|3.12) ok "python $pyv" ;;
-    *)         bad "python $pyv, expected 3.11 or 3.12" ;;
+    3.10|3.11|3.12) ok "python $pyv" ;;
+    *)              bad "python $pyv, expected 3.10, 3.11 or 3.12" ;;
 esac
 info "pip $(python3 -m pip --version 2>/dev/null | awk '{print $2}')"
 
@@ -138,7 +154,7 @@ PY
 # vllm_ascend must have been compiled for the 950/A5 family. Getting this wrong
 # mis-dispatches at inference time, and _310P here would mean the image was
 # built with the 310P SOC_VERSION by mistake.
-dt=$(python3 -c "from vllm_ascend import _build_info; print(_build_info.__device_type__)" 2>/dev/null)
+dt=$(python3 -c "from vllm_ascend import _build_info; print(_build_info.__device_type__)" 2>/dev/null | tail -1)
 case "$dt" in
     A5)   ok "vllm_ascend built for device family $dt (Ascend 950 / DaVinci v3)" ;;
     _310P) bad "vllm_ascend built for '_310P' - this image was built with the 310P SOC_VERSION" ;;
@@ -159,6 +175,7 @@ d = os.path.dirname(vllm_ascend.__file__)
 print((glob.glob(os.path.join(d, "vllm_ascend_C*.so")) or [""])[0])
 PY
 )
+ext_so=$(printf '%s\n' "$ext_so" | tail -1)
 if [ -n "$ext_so" ] && [ -f "$ext_so" ]; then
     ok "vllm_ascend_C built into the wheel ($(basename "$ext_so"))"
     # libtorch/libtorch_npu live in the wheels, not on the default search path,
@@ -169,6 +186,7 @@ print(":".join(os.path.join(os.path.dirname(m.__file__), "lib")
                 for m in (torch, torch_npu)))
 PY
 )
+    torch_libs=$(printf '%s\n' "$torch_libs" | tail -1)
     unresolved=$(LD_LIBRARY_PATH="$torch_libs:$(dirname "$ext_so"):${LD_LIBRARY_PATH:-}" \
         ldd -r "$ext_so" 2>&1 | grep "undefined symbol" | grep -vcE "undefined symbol: _?Py")
     if [ "${unresolved:-1}" -eq 0 ]; then
@@ -224,7 +242,28 @@ if [ -e "$kernels_so" ]; then
 else
     info "libvllm_ascend_kernels.so absent, as the ascend950 CMake gate dictates"
 fi
-info "MLAPO / batch_matmul_transpose are excluded upstream on this SoC"
+
+# THE ACLNN CUSTOM OPS ARE A SEPARATE MECHANISM, and on this SoC they are very
+# much built. An earlier revision of this suite (and of the docs) said the 950
+# gets no custom kernels at all, which conflated two different things:
+#
+#   ascendc_library(vllm_ascend_kernels)  -> genuinely skipped for ascend950,
+#                                            hence no libvllm_ascend_kernels.so
+#   csrc/build_aclnn.sh                   -> builds 27 ACLNN ops for ascend950
+#                                            (mla_prolog_v3 among them, so MLAPO
+#                                            is NOT excluded here), packages them
+#                                            with CPack and installs them under
+#                                            vllm_ascend/_cann_ops_custom
+#
+# That package is the single largest product of the build - 493 kernel binaries,
+# ~90 minutes of compilation - so its presence is asserted rather than assumed.
+ops_vendor=$(python3 -c "import os, vllm_ascend; print(os.path.join(os.path.dirname(vllm_ascend.__file__), '_cann_ops_custom', 'vendors', 'custom_transformer'))" 2>/dev/null | tail -1)
+if [ -n "$ops_vendor" ] && [ -d "$ops_vendor" ] && [ -e "$ops_vendor/op_api/lib/libcust_opapi.so" ]; then
+    ok "ACLNN custom ops installed ($(find "$ops_vendor" -type f | wc -l) files, libcust_opapi.so present)"
+    info "built for SOC ascend950 by csrc/build_aclnn.sh, including mla_prolog_v3"
+else
+    bad "ACLNN custom op package missing under vllm_ascend/_cann_ops_custom"
+fi
 
 if [ "$NDEV" -gt 0 ]; then
     # A tenth assertion, reachable only on a real NPU host. The build-host run
@@ -240,11 +279,27 @@ else
 fi
 
 step "7. vLLM entrypoint"
+# `vllm serve --help` loads the platform plugin, which imports triton-ascend,
+# whose driver asks the NPU for its architecture. With no device attached that
+# returns NULL and raises
+#     triton/backends/ascend/driver.py get_arch()
+#     SystemError: <built-in function get_arch> returned NULL without setting
+#     an exception
+# This is the same class of hardware dependency as the vllm_ascend_C import in
+# step 5 -- a property of the Ascend stack, not of this image -- so on a host
+# with no /dev/davinci* it is reported, not counted as a failure. Where a
+# device IS present the check is enforced, because there it must work.
 if command -v vllm >/dev/null; then
-    if vllm serve --help >/dev/null 2>&1; then
+    if vllm serve --help >/tmp/vllm-help.log 2>&1; then
         ok "vllm CLI on PATH and 'vllm serve --help' works ($(command -v vllm))"
+    elif [ "$NDEV" -eq 0 ] && grep -q "get_arch\|returned NULL" /tmp/vllm-help.log; then
+        ok "vllm CLI on PATH ($(command -v vllm))"
+        info "'vllm serve --help' cannot run here: triton-ascend's driver queries"
+        info "the NPU architecture at import and there is no device. Expected on a"
+        info "build host; re-run this suite on a 950 to exercise it."
     else
         bad "vllm CLI present but 'vllm serve --help' failed"
+        tail -5 /tmp/vllm-help.log
     fi
 else
     bad "vllm CLI missing"
