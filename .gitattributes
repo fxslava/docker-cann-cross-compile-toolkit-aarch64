@@ -22,4 +22,5 @@ builders/**/*.sh         text eol=lf
 common/**/Dockerfile*    text eol=lf
 common/**/*.Dockerfile   text eol=lf
 common/**/*.sh           text eol=lf
+common/**/*.c            text eol=lf
 *.yaml                   text eol=lf

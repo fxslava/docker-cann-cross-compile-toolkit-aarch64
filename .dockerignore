@@ -33,3 +33,11 @@ deps/950pr-x86_64/src/*.tar.gz
 artifacts
 artifacts/**
 *.tar.gz
+
+# ...except the googletest source, which IS part of the offline payload.
+# `*.tar.gz` above is unanchored, so it matches at any depth and would drop
+# deps/builder-x86_64/googletest-*.tar.gz from the context. The Dockerfile only
+# WARNS when it cannot find it, so the loss shows up much later as csrc/tests
+# trying to clone googletest from github.com inside a --network=none build.
+# Last matching pattern wins, so this has to come after.
+!deps/builder-x86_64/googletest-*.tar.gz

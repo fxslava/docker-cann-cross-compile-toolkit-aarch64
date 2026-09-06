@@ -173,15 +173,137 @@ int main()
     return 0;
 }
 APP_EOF
+# --allow-shlib-undefined IS REQUIRED, and it is not papering over a broken
+# sysroot. CANN's aarch64 dependency graph is genuinely incomplete by design:
+#
+#   libascendcl.so -> libmsprofiler.so, whose DT_NEEDED lists libprofapi.so
+#   but NOT libprofimpl.so - and libprofimpl.so is what defines the ProfAcl*
+#   symbols libmsprofiler.so references. CANN dlopens it at run time.
+#
+# Adding -lprofimpl by hand does not help; it only moves the failure one level
+# down, to halProfSampleRegister / halProfSampleDataReport, which are defined
+# by the REAL driver's libascend_hal.so. devlib's link-time stub does not
+# define them, and no build host without an NPU has the real one.
+#
+# So ld's default --no-allow-shlib-undefined asks for something that cannot be
+# satisfied off-target. The flag says "these come from a shared library that
+# resolves them at run time", which is exactly the situation. What this check
+# still proves is what matters: the headers resolve, libascendcl.so is found
+# and is AArch64, and a real AArch64 executable comes out the other end.
 if aarch64-linux-gnu-g++ "$TMP/acl_app.cpp" -o "$TMP/acl_app" \
         -I"$SR/include" -L"$SR/lib64" \
         -Wl,-rpath-link,"$SR/lib64:$SR/devlib/linux/aarch64" \
+        -Wl,--allow-shlib-undefined \
         -lascendcl 2>"$TMP/link.log"; then
     f=$(readelf -h "$TMP/acl_app" | awk -F: '/Machine:/{gsub(/^ +/,"",$2);print $2}')
     ok "ARM64 ACL application linked; ELF machine: $f"
 else
     bad "ARM64 ACL link failed"
     sed -n '1,30p' "$TMP/link.log"
+fi
+
+step "5. Ascend 310P operator package"
+# The toolkit .run ships neither libopapi.so nor an ascend310p kernel tree nor
+# an op_tiling directory; builders/builder-x86_64/provision.sh stages all three
+# out of the vendor image. Reported as INFO rather than FAIL when the image was
+# built WITH_SIMULATOR=0, because then it is absent by request.
+if [ -f "$TK/lib64/libopapi.so" ]; then
+    ok "libopapi.so present ($(stat -c%s "$TK/lib64/libopapi.so") bytes)"
+    # One nm into a file, then grep the file. NOT `nm ... | grep -q "$sym"` in a
+    # loop: this script runs under `set -o pipefail`, grep -q exits at the first
+    # match, nm then dies of SIGPIPE, and the pipeline reports failure even
+    # though the symbol was found. That reads as "libopapi.so exports none of
+    # the six operators" on an image where all six are present and the suite
+    # runs fine.
+    nm -D --defined-only "$TK/lib64/libopapi.so" > "$TMP/opapi.syms" 2>/dev/null
+    miss=""
+    for sym in aclnnRmsNorm aclnnMatmul aclnnSwiGlu aclnnApplyRotaryPosEmbV2 \
+               aclnnScatterPaKvCache aclnnIncreFlashAttentionV4; do
+        grep -q "$sym" "$TMP/opapi.syms" || miss="$miss $sym"
+    done
+    [ -z "$miss" ] \
+        && ok "all six operators csrc/tests resolves are exported" \
+        || bad "libopapi.so does not export:$miss"
+
+    K="$TK/opp/built-in/op_impl/ai_core/tbe/kernel/ascend310p"
+    [ -d "$K" ] \
+        && ok "ascend310p binary kernels present ($(find "$K" -type f | wc -l) files)" \
+        || bad "no ascend310p kernel tree under $K"
+
+    # ops_legacy is where TransData and MatMul live, and aclnnMatmul lowers
+    # onto both. A tree without it passes every check above and then fails the
+    # matmul suite with 561103 "cannot open op kernel bin json file".
+    if [ -d "$K/ops_legacy/mat_mul" ] && [ -d "$K/ops_legacy/trans_data" ]; then
+        ok "ops_legacy staged ($(find "$K/ops_legacy" -maxdepth 1 -mindepth 1 -type d | wc -l) operators, $(du -sh "$K/ops_legacy" | cut -f1))"
+    else
+        bad "ops_legacy is missing or trimmed; aclnnMatmul will fail with 561103"
+    fi
+
+    # The half that is easy to miss. Without it every aclnn call fails at plan
+    # time with 561002 "Do not find tiling func of <Op>", which reads like a
+    # missing kernel and is not.
+    T="$TK/opp/built-in/op_impl/ai_core/tbe/op_tiling/lib/linux/x86_64/liboptiling.so"
+    [ -f "$T" ] \
+        && ok "host-side tiling functions present ($(stat -c%s "$T") bytes)" \
+        || bad "no op_tiling/liboptiling.so; every aclnn call will fail with 561002"
+else
+    echo "  [INFO] no operator package staged (WITH_SIMULATOR=0);"
+    echo "         csrc/tests would skip every device case"
+fi
+
+step "6. CAModel simulator, end to end"
+# The point of the simulator: a native x86_64 ACL program that opens a device,
+# creates a stream and reports the SoC, with no NPU and no driver in the image.
+if [ ! -x /usr/local/bin/ascend-sim-env.sh ] || [ ! -f /opt/ascend-sim/lib/libsocshim.so ]; then
+    echo "  [INFO] simulator not wired into this image (WITH_SIMULATOR=0)"
+else
+    SIM="$TK/tools/simulator/${ASCEND_SIM_SOC_VERSION:-$SOC}/lib"
+    [ -f "$SIM/libruntime_camodel.so" ] \
+        && ok "CAModel runtime present for ${ASCEND_SIM_SOC_VERSION:-$SOC}" \
+        || bad "no libruntime_camodel.so under $SIM"
+
+    cat > "$TMP/sim_app.cpp" <<'SIM_EOF'
+#include "acl/acl.h"
+#include <cstdio>
+// set_device and reset_device MUST be paired: CANN's own launcher notes that
+// an unpaired pair core dumps the simulator.
+int main()
+{
+    aclrtContext ctx = nullptr;
+    aclrtStream  st  = nullptr;
+    if (aclInit(nullptr) != ACL_SUCCESS)                 { printf("aclInit\n");   return 1; }
+    if (aclrtSetDevice(0) != ACL_SUCCESS)                { printf("setDevice\n"); return 2; }
+    if (aclrtCreateContext(&ctx, 0) != ACL_SUCCESS)      { printf("context\n");   return 3; }
+    if (aclrtCreateStream(&st) != ACL_SUCCESS)           { printf("stream\n");    return 4; }
+    const char *name = aclrtGetSocName();
+    printf("SOC=%s\n", name ? name : "(null)");
+    aclrtDestroyStream(st);
+    aclrtDestroyContext(ctx);
+    aclrtResetDevice(0);
+    aclFinalize();
+    return 0;
+}
+SIM_EOF
+    # Native x86_64, not the cross toolchain: this one has to RUN here.
+    if g++ -m64 "$TMP/sim_app.cpp" -o "$TMP/sim_app" \
+            -I"$TK/include" -L"$TK/lib64" -lascendcl 2>"$TMP/simlink.log"; then
+        ok "native x86_64 ACL application linked against the host libascendcl.so"
+        mkdir -p "$TMP/run"
+        out=$(cd "$TMP/run" && CAMODEL_LOG_PATH="$TMP/run" \
+              timeout -s KILL 300 /usr/local/bin/ascend-sim-env.sh "$TMP/sim_app" 2>&1)
+        soc=$(printf '%s\n' "$out" | sed -n 's/^SOC=//p')
+        if [ -n "$soc" ]; then
+            ok "CAModel came up and reported soc=$soc"
+            [ "$soc" = "${ASCEND_SIM_SOC_VERSION:-$SOC}" ] \
+                || bad "simulator reports $soc, expected ${ASCEND_SIM_SOC_VERSION:-$SOC}"
+        else
+            bad "CAModel did not come up"
+            printf '%s\n' "$out" | grep -vE 'DRVSTUB_LOG|drvMoveTsReport|config_file.cc' | tail -15
+        fi
+    else
+        bad "native ACL link failed"
+        sed -n '1,20p' "$TMP/simlink.log"
+    fi
 fi
 
 step "Summary"

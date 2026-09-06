@@ -818,9 +818,11 @@ driver queries the NPU architecture at import time.
 │   ├── docker/                      base stage, compiler env, driver plumbing
 │   └── patches/                     vendor script shims
 │
-├── builders/builder-x86_64/         x86_64 → aarch64 cross-compilation image
+├── builders/builder-x86_64/         cross-compilation + 310P3 CAModel simulator
 │   ├── README.md                    its own guide
 │   ├── Dockerfile  assemble_sysroot.sh  verify.sh
+│   ├── provision.sh                 stages the 310P operator package
+│   └── ascend-sim-env.sh            activates the CAModel simulator
 │
 ├── docs/                            design notes and build records
 ├── deps/<target>/                   offline payload                [GIT-IGNORED]
@@ -969,5 +971,5 @@ the Git Bash side writes to the Windows temp directory instead.
 | [docs/soc-build-matrix.md](docs/soc-build-matrix.md) | what has to change to retarget another SoC (310P3 / 910B / 950) |
 | [docs/cann-native-unpack.md](docs/cann-native-unpack.md) | the host-architecture CANN unpacker stage and how its output was verified |
 | [docs/cross-compilation-analysis.md](docs/cross-compilation-analysis.md) | where the build time goes, with measurements |
-| [builders/builder-x86_64/README.md](builders/builder-x86_64/README.md) | the x86_64 → aarch64 cross-compilation toolchain image |
+| [builders/builder-x86_64/README.md](builders/builder-x86_64/README.md) | the x86_64 toolchain image: aarch64 cross-compilation **and** running 310P3 device code natively on CANN's CAModel simulator, with no NPU |
 | [ascend-project.sample.yaml](ascend-project.sample.yaml) | every target's release matrix, side by side |
