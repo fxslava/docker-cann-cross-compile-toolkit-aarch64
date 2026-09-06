@@ -7,8 +7,8 @@
 #   ./download_deps.sh [dest-dir]        (default: ~/cann-build)
 #
 # Set DEPS_ONLY to an extended regex to fetch a subset. The AArch64 offline
-# inference image (docker/target-310p/Dockerfile.aarch64) needs neither the
-# x86_64 toolkit nor the cross sysroot, so provision_deps_aarch64.sh calls it as:
+# inference image (targets/target-310p/Dockerfile.aarch64) needs neither the
+# x86_64 toolkit nor the cross sysroot, so targets/target-310p/provision.sh calls it as:
 #
 #   DEPS_ONLY='aarch64|^torch-' ./download_deps.sh ./deps
 #

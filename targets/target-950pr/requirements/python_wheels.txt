@@ -1,0 +1,72 @@
+# ---------------------------------------------------------------------------
+# The cp310 / manylinux x86_64 wheelhouse that deps/950pr-x86_64/python_wheels/
+# must contain for Dockerfile.x86_64 to install with --no-index.
+#
+# cp310 because the base is Ubuntu 22.04 and jammy's system interpreter is
+# python3.10. Every pin below publishes a cp310 manylinux_2_28 x86_64 wheel and
+# vLLM 0.27.1 declares requires-python >=3.10,<3.15, so nothing is given up by
+# staying on the distribution's own interpreter.
+#
+# Every pin below is read out of vllm-project/vllm-ascend@main, not chosen
+# here: requirements.txt + pyproject.toml pin the torch stack, and
+# Dockerfile.a5 (the upstream 950/A5 reference image) pins vLLM and
+# triton-ascend. Re-read them before bumping any single line - this set moves
+# together or not at all, exactly like the 310P matrix.
+#
+#   upstream ref     vllm-ascend@main, Dockerfile.a5
+#   CANN             9.1.0
+#   base image there quay.io/ascend/cann:9.1.0-950-ubuntu22.04-py3.12
+#                    (Huawei also publishes -py3.10 and -py3.11 of that tag;
+#                    this image is the 3.10 line, on plain ubuntu:22.04)
+#
+# WHERE THESE COME FROM
+#   torch, torchvision, torchaudio  download.pytorch.org/whl/cpu
+#   torch-npu                       PyPI: 2.10.0, .post2, .post4 and .post6 as
+#                                   cp310-cp313 manylinux_2_28 wheels for both
+#                                   x86_64 and aarch64.
+#   triton-ascend                   mirrors.huaweicloud.com/ascend/repos/pypi
+#                                   ONLY. PyPI stops at 3.2.0; 3.2.2 exists just
+#                                   on the Ascend mirror, whose index is served
+#                                   at the root of that path - a /simple/ prefix
+#                                   returns 404. Most likely staging failure.
+#   everything else                 PyPI
+#
+# vLLM IS DELIBERATELY ABSENT FROM THIS FILE.
+# The x86_64 `vllm` wheel on PyPI is a CUDA build. vLLM must be built from the
+# v0.27.1 source with VLLM_TARGET_DEVICE=empty, the way upstream's Dockerfile.a5
+# does it, and the resulting wheel staged into python_wheels/. The Ascend
+# backend lives entirely in vllm-ascend.
+# ---------------------------------------------------------------------------
+
+# --- build backend (installed first, before anything else resolves) ---------
+pip
+setuptools>=64
+setuptools-scm>=8
+wheel
+packaging
+cmake>=3.26
+pybind11
+
+# --- torch stack, pinned as a set ------------------------------------------
+torch==2.10.0
+torch-npu==2.10.0.post4
+torchvision==0.25.0
+torchaudio==2.10.0
+
+# --- vllm-ascend's own requirements ----------------------------------------
+decorator
+einops
+numpy
+pandas
+psutil
+pyyaml
+regex
+scipy
+xgrammar>=0.1.30
+compressed_tensors>=0.11.0
+
+# --- Ascend-mirror only; drop both if the mirror is unreachable -------------
+# triton-ascend replaces the triton that the x86_64 vLLM wheel pulls in, which
+# does not work on Ascend. Upstream uninstalls triton and installs this.
+# Requires clang-15 at build time (see packages/sys_packages.txt).
+triton-ascend==3.2.2

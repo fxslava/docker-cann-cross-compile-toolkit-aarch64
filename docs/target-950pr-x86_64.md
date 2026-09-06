@@ -17,7 +17,7 @@ install** (§6).
 This is the sibling of the 310P image in [README.aarch64.md](../README.aarch64.md).
 The two differ in more than the SoC:
 
-| | 310P3 (`docker/target-310p`) | 950PR (`docker/target-950pr`) |
+| | 310P3 (`targets/target-310p`) | 950PR (`targets/target-950pr`) |
 |---|---|---|
 | Image architecture | `linux/arm64`, QEMU-emulated at build time | `linux/amd64`, **native** |
 | Base OS / Python | Ubuntu 22.04 / 3.10 | Ubuntu 22.04 / 3.10 |
@@ -81,12 +81,11 @@ Read out of `vllm-ascend@main` (`requirements.txt`, `pyproject.toml`) and its
 | torchvision / torchaudio | 0.25.0+cpu / 2.10.0+cpu | download.pytorch.org/whl/cpu |
 | triton-ascend | 3.2.2 | **Ascend mirror only**; needs clang-15 |
 
-Three traps worth stating plainly:
+Three traps:
 
-* **PyPI's x86_64 `vllm` wheel is a CUDA build.** On aarch64 this was already
-  true; on x86_64 pip will resolve it happily and produce an image that imports
-  cleanly and dispatches to nothing. The wheel must be built from the v0.27.1
-  source with `VLLM_TARGET_DEVICE=empty`.
+* **PyPI's x86_64 `vllm` wheel is a CUDA build.** As on aarch64: pip resolves it
+  cleanly and produces an image that imports and dispatches to nothing. The
+  wheel must be built from the v0.27.1 source with `VLLM_TARGET_DEVICE=empty`.
 
   Building it that way does more than skip the CUDA kernels. `setup.py`'s
   `get_requirements()` reads `requirements/common.txt` for the empty target
@@ -105,12 +104,12 @@ Three traps worth stating plainly:
   `platform_system == "Linux" and platform_machine == "x86_64"` — exactly this
   target — so an unconstrained resolve stages several GB of CUDA runtime that
   an Ascend NPU cannot use, and whose `torch` shadows the CPU build `torch_npu`
-  is compiled against. `docker/target-950pr/constraints.x86_64.txt` pins
+  is compiled against. `targets/target-950pr/constraints.x86_64.txt` pins
   `torch==2.10.0+cpu` (plus `torchvision`/`torchaudio` `+cpu`), which declare no
   `nvidia` requirements at all. This is the same mechanism, against the
-  opposite architecture, as `docker/target-310p/constraints.aarch64.txt`.
+  opposite architecture, as `targets/target-310p/constraints.aarch64.txt`.
   Three places enforce it, so a slip cannot reach the image quietly:
-  `fetch_wheels.sh` fails the resolve, `build_950pr_x86_64.sh` fails preflight,
+  `fetch_wheels.sh` fails the resolve, `targets/target-950pr/build.sh` fails preflight,
   and the Dockerfile asserts no `nvidia-*` distribution is installed and that
   `torch.__version__` ends in `+cpu`.
 * **triton-ascend 3.2.2 is Ascend-mirror only.** PyPI stops at 3.2.0. 3.2.2
@@ -129,8 +128,8 @@ table above is corrected: PyPI now carries 2.10.0, `.post2`, `.post4` and
 ## 3. Build flags and environment
 
 ```bash
-./build_950pr_x86_64.sh
-./build_950pr_x86_64.sh --save artifacts/vllm-ascend-950pr-x86_64-offline.tar.gz
+./targets/target-950pr/build.sh
+./targets/target-950pr/build.sh --save artifacts/vllm-ascend-950pr-x86_64-offline.tar.gz
 ```
 
 which wraps:
@@ -140,7 +139,7 @@ docker buildx build \
     --platform linux/amd64 \
     --network=none \
     --build-arg SOC_VERSION=ascend950dt_9582 \
-    -f docker/target-950pr/Dockerfile.x86_64 \
+    -f targets/target-950pr/Dockerfile.x86_64 \
     -t vllm-ascend-950pr:x86_64-offline \
     --load \
     .
@@ -166,7 +165,7 @@ matches none of those gates: the build would succeed while silently taking the
 generic branch, which is a worse outcome than failing.
 
 This is the same trap the 310P hit from the other side (see README.aarch64.md
-§"Why `SOC_VERSION` is lowercase `ascend310p3`"). `build_950pr_x86_64.sh`
+§"Why `SOC_VERSION` is lowercase `ascend310p3`"). `targets/target-950pr/build.sh`
 rejects anything not starting with `ascend950` during preflight.
 
 `ascend950dt_9582` is the value upstream's `Dockerfile.a5` ships. On real
@@ -205,7 +204,7 @@ docker run -d --name vllm-950pr \
 
 ## 4. Dependency staging plan — `deps/950pr-x86_64/`
 
-`docker/target-950pr/deps.manifest` is the machine-readable version of this
+`targets/target-950pr/deps.manifest` is the machine-readable version of this
 section; the build script parses it and refuses to start until every row is
 satisfied. Sizes there were measured with HTTP range requests; SHA-256 values
 are deliberately unpinned (`-`) because they cannot be known without
@@ -223,15 +222,15 @@ deps/950pr-x86_64/
 
 ### The scripted route
 
-`provision_deps_950pr_x86_64.sh` does all of it, and is the sibling of
-`provision_deps_aarch64.sh` — minus the QEMU, because host and target are the
+`targets/target-950pr/provision.sh` does all of it, and is the sibling of
+`targets/target-310p/provision.sh` — minus the QEMU, because host and target are the
 same architecture here, so every container runs natively and resolves against
 the real target environment instead of an emulated one:
 
 ```bash
-./provision_deps_950pr_x86_64.sh                 # everything that is missing
-./provision_deps_950pr_x86_64.sh cann            # or one stage at a time:
-./provision_deps_950pr_x86_64.sh src debs vllm wheels verify
+./targets/target-950pr/provision.sh                 # everything that is missing
+./targets/target-950pr/provision.sh cann            # or one stage at a time:
+./targets/target-950pr/provision.sh src debs vllm wheels verify
 ```
 
 Stages are idempotent and resumable — re-running skips what is already
@@ -260,7 +259,7 @@ enabled; it is not in the release pocket:
 
 ```bash
 docker run --rm -v "$PWD/deps/950pr-x86_64/apt_debs:/out" \
-  -v "$PWD/docker/target-950pr/packages/sys_packages.txt:/pkgs.txt:ro" \
+  -v "$PWD/targets/target-950pr/packages/sys_packages.txt:/pkgs.txt:ro" \
   ubuntu:22.04 bash -c '
     apt-get update -qq &&
     apt-get install -y --no-install-recommends --download-only \
@@ -278,13 +277,13 @@ stages several GB of `nvidia-*-cu12` wheels (see §2).
 
 ```bash
 pip download --only-binary=:all: -d deps/950pr-x86_64/python_wheels \
-  -r docker/target-950pr/requirements/python_wheels.txt \
-  --constraint docker/target-950pr/constraints.x86_64.txt \
+  -r targets/target-950pr/requirements/python_wheels.txt \
+  --constraint targets/target-950pr/constraints.x86_64.txt \
   --extra-index-url https://download.pytorch.org/whl/cpu \
   --extra-index-url https://mirrors.huaweicloud.com/ascend/repos/pypi
 ```
 
-Then confirm the payload is CUDA-free before building — `build_950pr_x86_64.sh`
+Then confirm the payload is CUDA-free before building — `targets/target-950pr/build.sh`
 checks this in preflight and refuses to start otherwise:
 
 ```bash
@@ -416,7 +415,7 @@ each for a reason that would otherwise cause a silent failure:
    `deps/950pr-x86_64/cann_extra/` (183 MB, 26 libraries) — the same route the
    310P used to obtain `libhccl.so` on CANN 8.5.0.
 
-   `provision_deps_950pr_x86_64.sh cann_extra` does this without a `docker
+   `targets/target-950pr/provision.sh cann_extra` does this without a `docker
    pull`: it resolves the amd64 manifest, fetches the 4.41 GB layer with the
    same parallel range-request downloader used for the CANN `.run` files
    (~70 s at ~20 MB/s), and extracts only the missing `.so` files.
@@ -438,7 +437,7 @@ Unverified, and honestly so:
     <toolkit>/ascendc_kernel_cmake/legacy_modules/host_config.cmake
   ```
 
-  `build_950pr_x86_64.sh` runs that check automatically when it finds an
+  `targets/target-950pr/build.sh` runs that check automatically when it finds an
   extracted toolkit under the payload directory, and says so when it cannot.
 * ~~**PEP 668 handling.**~~ **No longer a concern on this base.** Jammy ships
   no `/usr/lib/python3.10/EXTERNALLY-MANAGED` marker (checked in the
@@ -457,7 +456,7 @@ Unverified, and honestly so:
 ## 7. Measured results
 
 Built natively on x86_64 (12 cores, WSL2) with `--network=none`, from a payload
-staged by `provision_deps_950pr_x86_64.sh`.
+staged by `targets/target-950pr/provision.sh`.
 
 | | |
 |---|---|
@@ -481,7 +480,7 @@ vllm_ascend_C: 118 exported symbols, no unresolved non-Python symbols
 ```
 
 **Zero NVIDIA artefacts**, enforced at four independent points: the constraint
-file, the wheelhouse resolve, `build_950pr_x86_64.sh` preflight, and an
+file, the wheelhouse resolve, `targets/target-950pr/build.sh` preflight, and an
 in-image assertion that no `nvidia-*` distribution is installed and that
 `torch.__version__` ends in `+cpu`.
 

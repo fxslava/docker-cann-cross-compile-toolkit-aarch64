@@ -1,0 +1,30 @@
+# ---------------------------------------------------------------------------
+# pip constraints applied to EVERY resolve, both when the wheelhouse is
+# downloaded and when the image installs from it.
+#
+# FAILURE MODE
+# The aarch64 torch wheels on PyPI are CUDA builds targeting GH200/Jetson.
+# vLLM's dependency compressed-tensors declares only a torch lower bound, so an
+# unconstrained resolve takes the newest torch and drags in ~5 GB of
+# nvidia-*-cu13 wheels - cuDNN alone is 651 MB. None of it runs on an Ascend
+# NPU, and that torch shadows the CPU build torch_npu is compiled against.
+#
+# Pinning the "+cpu" local-version build from download.pytorch.org keeps the
+# resolve on the CPU wheels: torch-2.8.0+cpu declares zero nvidia requirements,
+# so the whole CUDA subtree disappears. PyPI publishes no 2.8.0+cpu, so the pin
+# is unambiguous.
+#
+# PRECONDITION - THE VERSION IS NOT ARBITRARY
+# torch 2.8.0 / torch_npu 2.8.0.post2 is the stack vllm-ascend v0.13.0 declares,
+# and v0.13.0 is the release upstream builds against CANN 8.5.0, the toolkit
+# this repository pins. See README.aarch64.md for the full matrix.
+#
+# torchvision 0.23.0 is the release that pairs with torch 2.8.0. It has no
+# "+cpu" variant on the index (those only start at 0.25.0), so it is pinned by
+# plain version; it carries no nvidia requirements of its own.
+#
+# These are constraints, not requirements: they cap what may be chosen, they do
+# not install anything on their own.
+# ---------------------------------------------------------------------------
+torch==2.8.0+cpu
+torchvision==0.23.0

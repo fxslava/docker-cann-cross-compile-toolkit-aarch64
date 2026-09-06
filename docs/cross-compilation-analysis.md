@@ -4,7 +4,7 @@ Where the emulated build actually spends its time, how far a split
 host/target build gets today, and what is left to close it.
 
 All timings are from `--progress=plain` buildx logs on the WSL2 x86_64 host
-(12 cores), building `docker/target-310p/Dockerfile.aarch64` under `qemu-aarch64`. Reproduce with
+(12 cores), building `targets/target-310p/Dockerfile.aarch64` under `qemu-aarch64`. Reproduce with
 `docs/analyze_build.py <build.log>`.
 
 ---
@@ -62,7 +62,7 @@ So a host/target split is worth roughly **16% off a cold build** but plausibly
 
 ## 2. What was proven to work
 
-Experiments run in `cann85-cross-310p:latest` (the sibling `docker/builder-x86_64/Dockerfile`
+Experiments run in `cann85-cross-310p:latest` (the sibling `builders/builder-x86_64/Dockerfile`
 image: `aarch64-linux-gnu` GCC 11 + the x86_64 CANN 8.5.0 toolkit + the
 aarch64 CANN sysroot from `assemble_sysroot.sh`).
 
@@ -74,7 +74,7 @@ aarch64 CANN sysroot from `assemble_sysroot.sh`).
 | Does the generated `host_stub.cpp` cross-compile? | **Yes** — `host_stub.cpp.o` came out AArch64 under the toolchain file. |
 | Are all the target-side inputs available offline? | **Yes.** aarch64 `torch` 2.8.0+cpu and `torch_npu` 2.8.0.post2 wheels, the arm64 `libpython3.10-dev` deb, and the aarch64 `libascendc_runtime.a` are all already in `deps/`. |
 
-Two details that made the configure work, both worth keeping:
+Two details the configure depends on:
 
 * **A stub `torch` module on the host.** `CMakeLists.txt` asks the build
   interpreter two questions — `torch.__version__` and
@@ -226,7 +226,7 @@ manifest diff proving the resulting tree is identical to an emulated install.
 3. **Cost to be honest about:** a cross build additionally requires the x86_64
    CANN toolkit `.run` (~1.1 GB) in `deps/`, which today's offline payload does
    not carry, plus the stub-torch and toolchain-file machinery in §2. That is a
-   real increase in the offline surface `provision_deps_aarch64.sh` has to
+   real increase in the offline surface `targets/target-310p/provision.sh` has to
    guarantee.
 4. **The CANN extraction in §4 is the better first optimisation** if cold-build
    time is the goal: bigger win, no new payload, no vendor-cmake surgery.

@@ -39,3 +39,11 @@ __pycache__/
 
 # --- local scratch ---------------------------------------------------------
 *.log
+
+# --- local engineering handoff: never tracked -------------------------------
+# Operational briefing for engineers and agents entering this repository.
+# Local-only by design: it records host-specific findings, point-in-time state
+# and a return point, none of which should follow the repository to another
+# machine or become stale in history.
+docs/DEV_HANDOFF_ASCEND_OPS.md
+.agent-context/

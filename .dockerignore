@@ -17,9 +17,16 @@ deps/.provision
 deps/950pr-x86_64/src/vllm
 deps/950pr-x86_64/src/*.tar.gz
 
-# Image assets: Dockerfiles, entrypoints, verify suites, package lists,
-# constraints, container-side provisioning scripts.
-!docker
+# Target scaffolds: Dockerfile, entrypoint, verify suite, package lists,
+# constraints, manifests and patches.
+!targets
+
+# Shared scripts, base stage and vendor shims. Bind-mounted into build RUN
+# steps and into provisioning containers, so it must stay in the context.
+!common
+
+# Cross-compilation toolchain image.
+!builders
 
 # Final deployable archives. Redundant while `*` stands; explicit so a later
 # broad re-include cannot expose them.

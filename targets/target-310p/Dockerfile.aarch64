@@ -1,0 +1,319 @@
+# syntax=docker/dockerfile:1.7
+# ============================================================================
+#  Native AArch64 offline inference image for Huawei Ascend 310P3
+#
+#  Host   : x86_64 (WSL2 / Ubuntu 22.04) running the build under QEMU
+#  Image  : linux/arm64, Ubuntu 22.04, Python 3.10
+#  Target : Ascend 310P3 servers (AI Core arch dav-m200)
+#
+#  Contains CANN 8.5.0 (AArch64), PyTorch 2.8.0+cpu, torch_npu 2.8.0.post2,
+#  vLLM 0.13.0 (VLLM_TARGET_DEVICE=empty) and vllm-ascend 0.13.0 built from
+#  source, so the image can be saved to a tar and run air-gapped.
+#
+#  WHY EMULATION INSTEAD OF CROSS-COMPILATION
+#  vllm-ascend's build needs the TARGET interpreter: CMakeLists runs
+#  `import torch` for the version check and setup.py shells out to
+#  `pip show torch-npu` for the target headers. Emulating the whole build also
+#  keeps op_build and the libraries it dlopens on the same architecture.
+#  See README.aarch64.md for what a split host/target build would still cost.
+#
+#  EVERY STEP BELOW IS OFFLINE. The build takes no network at all:
+#    apt     -> deps/apt_debs (local file: repository)
+#    pip     -> deps/python_wheels (--no-index --find-links)
+#    CANN    -> deps/Ascend-cann-toolkit_8.5.0_linux-aarch64.run (bind mount)
+#    sources -> deps/src/vllm-ascend (bind mount, catlass submodule included)
+#  Populate all of that with ./targets/target-310p/provision.sh first.
+#
+#  Two base images are pulled if they are not already cached -- the arm64
+#  ${BASE_IMAGE} and the ${UNPACKER_IMAGE} used by stage 0 -- exactly as before,
+#  since --network=none governs RUN steps and not image resolution.
+#
+#  THE BUILD CONTEXT IS THE REPOSITORY ROOT, not this directory. deps/ is the
+#  offline payload and lives there, so every path below is repo-relative:
+#  deps/... for the payload, targets/target-310p/... for this image's own files.
+#
+#  Build:
+#    ./targets/target-310p/build.sh
+#  or, from the repository root:
+#    docker buildx build --platform linux/arm64 --network=none \
+#        -f targets/target-310p/Dockerfile.aarch64 \
+#        -t vllm-ascend-310p:aarch64-offline .
+# ============================================================================
+ARG BASE_IMAGE=ubuntu:22.04
+ARG CANN_VERSION=8.5.0
+ARG UNPACKER_IMAGE=python:3.10-slim
+
+# ---------------------------------------------------------------------------
+# 0. CANN toolkit, installed on the BUILD host's own architecture
+# ---------------------------------------------------------------------------
+# The aarch64 toolkit installer is the single most expensive step of this build:
+# 617 s under qemu-user against 74 s run natively, because it is a pure-shell
+# installer that spawns thousands of cp/ln/chmod processes and every one of them
+# pays the emulation tax. Nothing it does is architecture-specific -- it copies
+# aarch64 payload files into place from a data-driven filelist.csv (4060 rows of
+# mkdir/copy/del) and creates symlinks. The only thing tying it to aarch64 is
+# how it picks WHICH component packages to install, which it reads from `arch`.
+#
+# So: shim `arch` (and `uname -m`) to name the target, run the vendor installer
+# unmodified on $BUILDPLATFORM, and COPY the finished tree into the arm64 image.
+# Using the real installer rather than reassembling the payload by hand is what
+# makes this safe -- the resulting tree was diffed against an emulated install
+# and is identical: same 19144 files, same 620 symlinks, same modes, same
+# symlink targets, nothing missing and nothing extra.
+#
+# The base image must already carry python3 and pip3, which several components
+# invoke through their --pylocal step; that is why this is not ubuntu:22.04.
+# Nothing here reaches the network.
+#
+# If the build host is itself aarch64 the shim is simply a no-op and this stage
+# is a normal native install.
+FROM --platform=$BUILDPLATFORM ${UNPACKER_IMAGE} AS cann-unpacker
+ARG CANN_VERSION
+ARG TARGET_ARCH=aarch64
+RUN --mount=type=bind,source=deps/Ascend-cann-toolkit_${CANN_VERSION}_linux-aarch64.run,target=/tmp/cann.run \
+    set -eux; \
+    mkdir -p /shim; \
+    printf '#!/bin/sh\necho %s\n' "${TARGET_ARCH}" > /shim/arch; \
+    { echo '#!/bin/sh'; \
+      echo 'for a in "$@"; do case "$a" in -m|-p|-i) echo '"${TARGET_ARCH}"'; exit 0 ;; esac; done'; \
+      echo 'exec /bin/uname "$@"'; } > /shim/uname; \
+    chmod 0755 /shim/arch /shim/uname; \
+    PATH=/shim:$PATH bash /tmp/cann.run --full --quiet \
+        --install-path=/usr/local/Ascend --install-for-all; \
+    test -e /usr/local/Ascend/ascend-toolkit/latest/lib64/libascendcl.so; \
+    echo "installed $(find /usr/local/Ascend -type f | wc -l) files"
+
+# ---------------------------------------------------------------------------
+FROM --platform=linux/arm64 ${BASE_IMAGE}
+
+ARG DEBIAN_FRONTEND=noninteractive
+ARG CANN_VERSION
+ARG ASCEND_BASE=/usr/local/Ascend
+
+# SOC_VERSION IS DELIBERATELY LOWERCASE. setup.py's gen_build_info() asserts it
+# against an all-lowercase table and writes the device family that the RUNTIME
+# dispatches on, so "ASCEND310P3" fails the build outright; CMakeLists.txt then
+# gates its kernel exclusions on the uppercase spelling, which that assert can
+# never accept. patches/ resolves the conflict by making the CMake gate
+# case-insensitive. verify_runtime.sh asserts the resulting _310P.
+ARG SOC_VERSION=ascend310p3
+ARG COMPILE_CUSTOM_KERNELS=1
+
+# setuptools-scm cannot see a tag in a shallow or exported checkout, so the
+# wheel version is pinned explicitly. Override to match the provisioned
+# vllm-ascend ref.
+ARG VLLM_ASCEND_VERSION=0.13.0
+
+# ---------------------------------------------------------------------------
+# 1. Base packages, installed from the local arm64 apt archive
+# ---------------------------------------------------------------------------
+# deps/apt_debs carries the .deb closure of packages.aarch64.txt plus a
+# dpkg-scanpackages index, exposed as a `file:` repository so this is a normal
+# apt transaction with no network behind it.
+#
+# ldconfig segfaults intermittently under qemu-user while dpkg runs the
+# libc-bin trigger, which aborts the whole transaction. Stub it out for the
+# duration and restore the real binary afterwards.
+RUN --mount=type=bind,source=deps/apt_debs,target=/debs \
+    --mount=type=bind,source=targets/target-310p/packages.aarch64.txt,target=/tmp/packages.txt \
+    cp -aL /usr/sbin/ldconfig /usr/sbin/ldconfig.orig \
+    && printf '#!/bin/sh\nexit 0\n' > /usr/sbin/ldconfig \
+    && chmod 0755 /usr/sbin/ldconfig \
+    && mv /etc/apt/sources.list /etc/apt/sources.list.online \
+    && echo 'deb [trusted=yes] file:/debs ./' > /etc/apt/sources.list \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends \
+        $(grep -vE '^[[:space:]]*(#|$)' /tmp/packages.txt | tr '\n' ' ') \
+    && mv -f /etc/apt/sources.list.online /etc/apt/sources.list \
+    && rm -rf /var/lib/apt/lists/* \
+    && mv -f /usr/sbin/ldconfig.orig /usr/sbin/ldconfig \
+    && ldconfig \
+    && python3 --version
+
+# ---------------------------------------------------------------------------
+# 2. Python build backend, strictly offline
+# ---------------------------------------------------------------------------
+# jammy ships pip 22.0.2, which chokes on Metadata-Version 2.4 wheels, so the
+# very first thing installed from the wheelhouse is a newer pip.
+RUN --mount=type=bind,source=deps/python_wheels,target=/opt/wheels \
+    python3 -m pip install --no-cache-dir --no-index --find-links=/opt/wheels \
+        pip setuptools wheel setuptools-scm packaging \
+    && python3 -m pip --version
+
+# ---------------------------------------------------------------------------
+# 3. CANN 8.5.0 toolkit, taken from the host-side unpacker stage
+# ---------------------------------------------------------------------------
+# Installed with --full (`--install` plus the development/op-package payload,
+# which vllm-ascend's ACLNN custom-op build needs) and --install-for-all (keeps
+# the tree readable by the unprivileged HwHiAiUser the driver runs helpers as)
+# up in the cann-unpacker stage. COPY preserves modes, ownership and symlinks,
+# and BuildKit does the copy on the build host rather than under emulation.
+COPY --from=cann-unpacker /usr/local/Ascend ${ASCEND_BASE}
+
+# --- libhccl.so, which the toolkit package does not ship ---------------------
+# The CANN 8.5.0 toolkit installs HCCL as libhccl_{alg,fwk,legacy,plf}.so and no
+# aggregate libhccl.so. Every torch_npu build records libhccl.so in DT_NEEDED,
+# and torch auto-loads the torch_npu backend extension, so without it a plain
+# `import torch` dies before anything else runs:
+#     ImportError: libtorch_npu.so: undefined symbol: HcclReduceScatter
+#
+# A missing implementation, not a naming gap: of the ten HCCL symbols torch_npu
+# resolves, the split libraries provide four and nothing in the toolkit defines
+# HcclAllReduce, HcclAllGather, HcclBroadcast, HcclReduceScatter, HcclSend or
+# HcclRecv. targets/target-310p/provision.sh stages the real library out of Huawei's
+# own CANN 8.5.0 image; see step 1b there.
+RUN --mount=type=bind,source=deps/cann_extra,target=/cann_extra \
+    set -eu; \
+    lib="${ASCEND_BASE}/ascend-toolkit/latest/lib64"; \
+    n=$(find /cann_extra -maxdepth 1 -name '*.so*' | wc -l); \
+    [ "$n" -gt 0 ] || { \
+        echo "deps/cann_extra is empty; re-run targets/target-310p/provision.sh (step 1b)" >&2; \
+        exit 1; \
+    }; \
+    cp -n /cann_extra/*.so* "$lib/"; \
+    chmod 0755 "$lib"/*.so*; \
+    echo "filled $n CANN libraries the toolkit package omits"; \
+    [ -e "$lib/libhccl.so" ] || { echo "libhccl.so still absent" >&2; exit 1; }; \
+    [ -e "$lib/libopapi.so" ] || { echo "libopapi.so still absent" >&2; exit 1; }; \
+    ldconfig
+
+# ---------------------------------------------------------------------------
+# 4. Environment
+# ---------------------------------------------------------------------------
+# Mirrors ascend-toolkit/set_env.sh so that a plain `docker run <image> python3`
+# works without sourcing anything. /usr/local/Ascend/driver/lib64 is empty in
+# the image on purpose: it is where the host driver gets bind-mounted at run
+# time (see README.aarch64.md).
+#
+# The LAST entry, ${ASCEND_TOOLKIT_HOME}/devlib, is what makes `import
+# torch_npu` work with no NPU attached: torch_npu pulls in libascend_hal.so,
+# which normally ships with the host *driver*, and CANN keeps link-time stubs
+# in devlib for exactly this case. set_env.sh appends the same directory when
+# it cannot find a driver. It is last on the path on purpose, so a real driver
+# always wins on a real Ascend host.
+ENV ASCEND_TOOLKIT_HOME=/usr/local/Ascend/ascend-toolkit/latest
+ENV ASCEND_HOME_PATH=${ASCEND_TOOLKIT_HOME}
+ENV ASCEND_OPP_PATH=${ASCEND_TOOLKIT_HOME}/opp
+ENV ASCEND_AICPU_PATH=${ASCEND_TOOLKIT_HOME}
+ENV TOOLCHAIN_HOME=${ASCEND_TOOLKIT_HOME}/toolkit
+ENV PATH=${ASCEND_TOOLKIT_HOME}/bin:${ASCEND_TOOLKIT_HOME}/tools/ccec_compiler/bin:${ASCEND_TOOLKIT_HOME}/compiler/ccec_compiler/bin:${ASCEND_TOOLKIT_HOME}/tools/profiler/bin:${PATH}
+ENV LD_LIBRARY_PATH=/usr/local/Ascend/driver/lib64:/usr/local/Ascend/driver/lib64/common:/usr/local/Ascend/driver/lib64/driver:${ASCEND_TOOLKIT_HOME}/lib64:${ASCEND_TOOLKIT_HOME}/lib64/plugin/opskernel:${ASCEND_TOOLKIT_HOME}/lib64/plugin/nnengine:${ASCEND_TOOLKIT_HOME}/opp/built-in/op_impl/ai_core/tbe/op_tiling/lib/linux/aarch64:${ASCEND_TOOLKIT_HOME}/tools/aml/lib64:${ASCEND_TOOLKIT_HOME}/tools/aml/lib64/plugin:${ASCEND_TOOLKIT_HOME}/devlib
+ENV PYTHONPATH=${ASCEND_TOOLKIT_HOME}/python/site-packages:${ASCEND_TOOLKIT_HOME}/opp/built-in/op_impl/ai_core/tbe
+ENV CMAKE_PREFIX_PATH=${ASCEND_TOOLKIT_HOME}/lib64/cmake:${ASCEND_TOOLKIT_HOME}/toolkit/tools/tikicpulib/lib/cmake
+ENV SOC_VERSION=${SOC_VERSION}
+ENV ASCEND_AICORE_ARCH=dav-m200
+ENV COMPILE_CUSTOM_KERNELS=${COMPILE_CUSTOM_KERNELS}
+# Ascend runtime knobs upstream sets in its own images.
+ENV TASK_QUEUE_ENABLE=1
+ENV OMP_NUM_THREADS=1
+
+# From here on RUN uses bash, not dash: CANN's set_env.sh is a bash script and
+# the remaining stages source it.
+SHELL ["/bin/bash", "-c"]
+
+# ---------------------------------------------------------------------------
+# 5. PyTorch stack, vLLM and the vllm-ascend dependency set - all offline
+# ---------------------------------------------------------------------------
+# THREE separate pip transactions, in upstream's order, on purpose. vllm-ascend
+# carries pins that are tighter than vLLM's on the same packages -- numpy<2.0.0,
+# fastapi<0.124.0, opencv-python-headless<=4.11.0.86 -- and installing it last
+# lets those win, which is what upstream's Dockerfile.310p arranges too. At some
+# version pairings the two are not merely tighter but incompatible (vLLM 0.27.1
+# wants fastapi>=0.133.0 against vllm-ascend's <0.124.0), and then a single
+# joint resolve fails outright rather than picking a side.
+RUN --mount=type=bind,source=deps/python_wheels,target=/opt/wheels \
+    --mount=type=bind,source=targets/target-310p/requirements.aarch64.txt,target=/tmp/requirements.aarch64.txt \
+    --mount=type=bind,source=targets/target-310p/constraints.aarch64.txt,target=/tmp/constraints.aarch64.txt \
+    --mount=type=bind,source=deps/src/vllm-ascend/requirements.txt,target=/tmp/vllm-ascend-requirements.txt \
+    set -eux \
+    && PIPI="python3 -m pip install --no-cache-dir --no-index --find-links=/opt/wheels -c /tmp/constraints.aarch64.txt" \
+    && $PIPI -r /tmp/requirements.aarch64.txt \
+    && $PIPI vllm \
+    && grep -vEi '^[[:space:]]*(triton[-_]ascend|memfabric[-_]hybrid|memcache[-_]hybrid|arctic-inference)([[:space:]]|=|<|>|$)' \
+         /tmp/vllm-ascend-requirements.txt > /tmp/va-req.txt \
+    && $PIPI -r /tmp/va-req.txt \
+    && python3 -c "import torch, vllm; print('torch', torch.__version__, 'vllm', vllm.__version__)"
+
+# ---------------------------------------------------------------------------
+# 6. Build and install vllm-ascend for Ascend 310P3
+# ---------------------------------------------------------------------------
+# The source is copied out of the read-only bind mount because setup.py writes
+# _version.py, _build_info.py, build/ and .deps/ back into the tree.
+#
+# patches/ carries the local fixes to vllm-ascend, each documenting its rationale
+# above its diff; deps/src stays pristine so a ref bump only means rebasing them.
+# The 310P build does not work without them. The upstream .git is dropped first
+# because setuptools-scm shells out to git during bdist_wheel and rejects the
+# provisioning user's checkout as dubious ownership; the version comes from
+# SETUPTOOLS_SCM_PRETEND_VERSION, and `git apply` needs no repository.
+#
+# --no-build-isolation and --no-deps are both required, not merely faster:
+# pyproject.toml's build-system and requirements.txt name triton-ascend and
+# other packages published only on Huawei's mirror, and there is no network.
+# Stage 5 already installed everything the build needs.
+#
+# deps/third_party is merged into csrc/third_party, which is what
+# ${CANN_3RD_LIB_PATH} defaults to. On v0.13.0 for a 310P that payload is empty
+# and the merge is a no-op -- csrc/build_aclnn.sh exits immediately because the
+# release ships no custom ACLNN ops for the 310P. Refs that do have one fetch
+# abseil-cpp, protobuf, nlohmann/json and makeself from gitcode.com and check
+# ${CANN_3RD_LIB_PATH} first, so staging them keeps such a ref buildable offline.
+RUN --mount=type=bind,source=deps/python_wheels,target=/opt/wheels \
+    --mount=type=bind,source=deps/third_party,target=/third_party \
+    --mount=type=bind,source=deps/src/vllm-ascend,target=/src/vllm-ascend \
+    --mount=type=bind,source=targets/target-310p/patches,target=/patches \
+    set -eux \
+    && cp -a /src/vllm-ascend /tmp/vllm-ascend \
+    && cd /tmp/vllm-ascend \
+    && rm -rf .git \
+    && for p in /patches/*.patch; do \
+           echo "applying $(basename "$p")"; \
+           git apply -v "$p"; \
+       done \
+    && cp -a /third_party/. csrc/third_party/ \
+    && CANN_MAKESELF="${ASCEND_TOOLKIT_HOME}/tools/op_project_templates/ascendc/customize/cmake/util/makeself" \
+    && if [ -f csrc/cmake/third_party/makeself-fetch.cmake ] \
+          && [ ! -f csrc/third_party/makeself/makeself.sh ]; then \
+           [ -f "$CANN_MAKESELF/makeself.sh" ] \
+               || { echo "this ref needs makeself; run targets/target-310p/provision.sh" >&2; exit 1; }; \
+           cp -a "$CANN_MAKESELF" csrc/third_party/makeself; \
+       fi \
+    && if [ -f csrc/third_party/makeself/makeself.sh ]; then \
+           chmod 0755 csrc/third_party/makeself/makeself.sh \
+                      csrc/third_party/makeself/makeself-header.sh; \
+       fi \
+    && export SETUPTOOLS_SCM_PRETEND_VERSION="${VLLM_ASCEND_VERSION}" \
+    && export SETUPTOOLS_SCM_PRETEND_VERSION_FOR_VLLM_ASCEND="${VLLM_ASCEND_VERSION}" \
+    && export CMAKE_BUILD_TYPE=Release \
+    && . ${ASCEND_BASE}/ascend-toolkit/set_env.sh \
+    && python3 setup.py bdist_wheel -d /tmp/va-dist \
+    && python3 -m pip install --no-cache-dir --no-index --find-links=/opt/wheels \
+        --no-deps /tmp/va-dist/*.whl \
+    && cd / && rm -rf /tmp/vllm-ascend /tmp/va-dist /root/.cache
+
+# ---------------------------------------------------------------------------
+# 7. Ascend driver plumbing expected on the target host
+# ---------------------------------------------------------------------------
+# Shared with the 950PR target; the uid/gid values and the arm64-only /lib64
+# symlink are documented in common/docker/driver_plumbing.sh.
+RUN --mount=type=bind,source=common/docker/driver_plumbing.sh,target=/tmp/driver_plumbing.sh \
+    sh /tmp/driver_plumbing.sh
+
+# ---------------------------------------------------------------------------
+# 8. Entrypoint and verification
+# ---------------------------------------------------------------------------
+# The nounset shim is sourced by the entrypoint and by run_dev.sh; the compiler
+# environment is for dev shells only, since the image carries the same values as
+# ENV. Both land after the kernel compile, so editing them rebuilds in seconds.
+COPY common/patches/ascend_setenv_nounset.sh /usr/local/lib/ascend/setenv.sh
+COPY common/docker/compiler_env.sh           /usr/local/lib/ascend/compiler_env.sh
+COPY targets/target-310p/entrypoint.sh       /usr/local/bin/entrypoint.sh
+COPY targets/target-310p/verify_runtime.sh   /usr/local/bin/verify-runtime.sh
+RUN chmod +x /usr/local/bin/entrypoint.sh /usr/local/bin/verify-runtime.sh
+
+# Fail the build, not the deployment, if the offline install did not take.
+RUN python3 -c "import torch; import torch_npu; import vllm; import vllm_ascend; print('ALL RUNTIME IMPORTS SUCCEEDED')"
+
+WORKDIR /workspace
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
+CMD ["serve"]

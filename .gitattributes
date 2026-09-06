@@ -3,16 +3,23 @@
 *.py text eol=lf
 Dockerfile text eol=lf
 Dockerfile.* text eol=lf
+*.Dockerfile text eol=lf
 .dockerignore text eol=lf
 *.patch text eol=lf
 
 # The rules above carry no slash, so git already applies them at any depth.
-# Spelled out for the partitioned build tree so that moving an asset between
-# docker/target-310p/ and docker/builder-x86_64/ cannot quietly drop the LF
-# guarantee that these files are executed with inside Linux containers.
-docker/**/Dockerfile*  text eol=lf
-docker/**/*.sh         text eol=lf
-docker/**/*.patch      text eol=lf
-docker/**/*.txt        text eol=lf
-docker/**/*.manifest   text eol=lf
-*.yaml                 text eol=lf
+# Spelled out for the partitioned tree so that moving an asset between
+# targets/, builders/ and common/ cannot quietly drop the LF guarantee these
+# files are executed with inside Linux containers. CRLF reaches a container as
+# `bash\r: No such file or directory`.
+targets/**/Dockerfile*   text eol=lf
+targets/**/*.sh          text eol=lf
+targets/**/*.patch       text eol=lf
+targets/**/*.txt         text eol=lf
+targets/**/*.manifest    text eol=lf
+builders/**/Dockerfile*  text eol=lf
+builders/**/*.sh         text eol=lf
+common/**/Dockerfile*    text eol=lf
+common/**/*.Dockerfile   text eol=lf
+common/**/*.sh           text eol=lf
+*.yaml                   text eol=lf

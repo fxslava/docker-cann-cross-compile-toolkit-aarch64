@@ -45,7 +45,7 @@ grep -nE '^set\((ascend|kirin)[a-z0-9_]*_list' \
 | Runtime dtype | must be `--dtype float16` |
 
 The 310P is inference-only silicon and its AI Core has no bf16 path, which is
-what `docker/target-310p/patches/0001-…-ascend310p-kernel-gates.patch` exists to handle: the
+what `targets/target-310p/patches/0001-…-ascend310p-kernel-gates.patch` exists to handle: the
 Ascend C kernels that instantiate over `__bf16`, and the ones using `PIPE_FIX`
 (a 910/910B-only synchronisation pipe), cannot be compiled and are excluded,
 with a stub translation unit supplying their `*_impl` symbols so the module
@@ -63,7 +63,7 @@ still links. See the patch header for the per-kernel reasoning.
 
 What has to change:
 
-* **`ARG SOC_VERSION`** in `docker/target-310p/Dockerfile.aarch64`, and **`ENV ASCEND_AICORE_ARCH`**
+* **`ARG SOC_VERSION`** in `targets/target-310p/Dockerfile.aarch64`, and **`ENV ASCEND_AICORE_ARCH`**
   from `dav-m200` to `dav-c220`.
 * **`verify_runtime.sh`** asserts `__device_type__ = _310P`; that check has to
   become target-aware or it will fail the build for a correct 910B image.
@@ -78,7 +78,7 @@ What has to change:
   monolithic `libhccl.so` and `libopapi.so` that the standalone toolkit omits)
   are staged out of `quay.io/ascend/cann:8.5.0-310p-ubuntu22.04-py3.11`. For a
   910B image they should come from the corresponding 910b CANN image instead;
-  `provision_deps_aarch64.sh` step 1b hardcodes the 310p tag.
+  `targets/target-310p/provision.sh` step 1b hardcodes the 310p tag.
 * Model/parallelism defaults differ: 910B has far more HBM and supports real
   tensor parallelism across dies.
 
@@ -107,7 +107,7 @@ One forward-looking hint already present: vllm-ascend 0.13.0's `setup.py` maps
 `ascend910_9579` to device family `A5`, so the plugin anticipates a generation
 that this CANN does not yet build for.
 
-**That separate image now exists as a scaffold.** `docker/target-950pr/` targets
+**That separate image now exists as a scaffold.** `targets/target-950pr/` targets
 a 950-class part on CANN **9.1.0** and x86_64, and [docs/target-950pr-x86_64.md](target-950pr-x86_64.md)
 carries its release matrix, its staging plan and the probe evidence that 9.1.0
 is the right line to pin. Two findings there change what this section implies:
@@ -128,8 +128,8 @@ is the right line to pin. Two findings there change what this section implies:
 | `SOC_VERSION` | `Dockerfile.aarch64` `ARG` | `ascend310p3` | `ascend910b1`… |
 | `ASCEND_AICORE_ARCH` | `Dockerfile.aarch64` `ENV` | `dav-m200` | `dav-c220` |
 | device-family assert | `verify_runtime.sh` step 4 | `_310P` | `A2` |
-| kernel-exclusion patch | `docker/target-310p/patches/0001-…` | active | inert (gate does not match) |
-| `cann_extra` source image | `provision_deps_aarch64.sh` step 1b | `…:8.5.0-310p-…` | needs the 910b tag |
+| kernel-exclusion patch | `targets/target-310p/patches/0001-…` | active | inert (gate does not match) |
+| `cann_extra` source image | `targets/target-310p/provision.sh` step 1b | `…:8.5.0-310p-…` | needs the 910b tag |
 | serving dtype | runtime `--dtype` | `float16` (forced) | bf16 or fp16 |
 
 A retarget is therefore mostly mechanical, with two things that are *not*

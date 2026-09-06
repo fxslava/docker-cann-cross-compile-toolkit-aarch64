@@ -1,0 +1,42 @@
+# ---------------------------------------------------------------------------
+# Ubuntu 22.04 (arm64) packages that Dockerfile.aarch64 installs from the local
+# apt archive in deps/apt_debs/.
+#
+# Read by BOTH targets/target-310p/provision.sh (to download them) and
+# Dockerfile.aarch64 (to install them), so the two can never drift.
+#
+# cmake is listed even though jammy ships 3.22.1 and vllm-ascend needs >= 3.26:
+# the CANN installer probes for it, and the pip `cmake` wheel installed later
+# into /usr/local/bin wins on PATH.
+# ---------------------------------------------------------------------------
+build-essential
+gcc
+g++
+make
+cmake
+ninja-build
+pkg-config
+git
+python3
+python3-dev
+python3-pip
+python3-venv
+python3-distutils
+patchelf
+protobuf-compiler
+numactl
+libnuma-dev
+libjemalloc2
+libpci3
+pciutils
+libxml2
+zlib1g-dev
+ca-certificates
+curl
+wget
+unzip
+xz-utils
+file
+binutils
+gawk
+net-tools

@@ -29,8 +29,10 @@ targets:
     description: >-
       Native AArch64 offline inference image for Ascend 310P3, built on an
       x86_64 host under QEMU emulation.
-    dockerfile: docker/target-310p/Dockerfile.aarch64
-    build_script: build_aarch64.sh
+    dockerfile: targets/target-310p/Dockerfile.aarch64
+    build_script: targets/target-310p/build.sh
+    provision_script: targets/target-310p/provision.sh
+    run_dev_script: targets/target-310p/run_dev.sh
     platform: linux/arm64
     emulated: true                     # qemu-aarch64 via binfmt_misc
     base_image: arm64v8/ubuntu:22.04
@@ -48,9 +50,9 @@ targets:
       torch: 2.8.0+cpu
       torch_npu: 2.8.0.post2
     patches:
-      - docker/target-310p/patches/0001-vllm-ascend-0.13.0-ascend310p-kernel-gates.patch
+      - targets/target-310p/patches/0001-vllm-ascend-0.13.0-ascend310p-kernel-gates.patch
     verify:
-      script: docker/target-310p/verify_runtime.sh
+      script: targets/target-310p/verify_runtime.sh
       assertions_on_build_host: 9
     artifact: artifacts/vllm-ascend-310p-aarch64-offline.tar.gz
 
@@ -61,8 +63,9 @@ targets:
       Native x86_64 offline inference image for Ascend 950PR (Atlas 350),
       DaVinci v3 / A5 device family. Host and target architecture are the same,
       so there is no emulation and no unpacker stage.
-    dockerfile: docker/target-950pr/Dockerfile.x86_64
-    build_script: build_950pr_x86_64.sh
+    dockerfile: targets/target-950pr/Dockerfile.x86_64
+    build_script: targets/target-950pr/build.sh
+    run_dev_script: targets/target-950pr/run_dev.sh
     platform: linux/amd64
     emulated: false
     # Jammy, matching upstream: Dockerfile.a5 builds on
@@ -72,7 +75,7 @@ targets:
     base_image: ubuntu:22.04
     python: "3.10"
     deps_dir: deps/950pr-x86_64
-    deps_manifest: docker/target-950pr/deps.manifest
+    deps_manifest: targets/target-950pr/deps.manifest
     soc:
       # Lowercase and upstream's own value. vllm-ascend gates the 950 paths on
       # the case-sensitive CMake regex `SOC_VERSION MATCHES "ascend950"`, so
@@ -97,8 +100,8 @@ targets:
       torchvision: 0.25.0+cpu
       torchaudio: 2.10.0+cpu
       triton_ascend: 3.2.2             # Ascend mirror only; PyPI stops at 3.2.0
-    constraints: docker/target-950pr/constraints.x86_64.txt
-    provision_script: provision_deps_950pr_x86_64.sh
+    constraints: targets/target-950pr/constraints.x86_64.txt
+    provision_script: targets/target-950pr/provision.sh
     patches: []                        # none, by design
     operator_coverage:
       # Two SEPARATE mechanisms, and only the first is gated off for ascend950.
@@ -111,7 +114,7 @@ targets:
       mla_prolog_v3: built               # MLAPO is NOT excluded on this SoC
       note: see docs/target-950pr-x86_64.md "Operator coverage"
     verify:
-      script: docker/target-950pr/verify_runtime.sh
+      script: targets/target-950pr/verify_runtime.sh
       assertions_on_build_host: 10       # 12 on a host with /dev/davinci*
     results:
       build_seconds: 5218                # 86m58s cold, ~87m of it kernel compile
@@ -128,9 +131,9 @@ builders:
       x86_64 cross-compilation toolchain: aarch64-linux-gnu GCC plus an
       assembled aarch64 CANN sysroot. Superseded for image builds by the
       emulated native path, kept for kernel and ACL app development.
-    dockerfile: docker/builder-x86_64/Dockerfile
+    dockerfile: builders/builder-x86_64/Dockerfile
     platform: linux/amd64
     stack:
       cann: 8.5.0
     verify:
-      script: docker/builder-x86_64/verify.sh
+      script: builders/builder-x86_64/verify.sh

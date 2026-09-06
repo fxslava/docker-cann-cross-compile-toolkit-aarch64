@@ -18,21 +18,33 @@ Self-contained, reproducible Docker build environment for cross-compiling Huawei
 ## Repository Structure
 
 ```text
-.
-├── docker/
-│   ├── builder-x86_64/          # THIS image: the cross-compilation toolchain
-│   │   ├── Dockerfile           # Multi-stage / BuildKit image recipe
-│   │   ├── assemble_sysroot.sh  # Extracts 170+ target AArch64 CANN libraries & driver stubs
-│   │   └── verify.sh            # 15-point automated verification suite
-│   ├── target-310p/             # sibling image: native AArch64 inference (README.aarch64.md)
-│   └── target-950pr/            # sibling image: native x86_64 Ascend 950PR (docs/target-950pr-x86_64.md)
+├── builders/
+│   └── builder-x86_64/          # THIS image: the cross-compilation toolchain
+│       ├── Dockerfile           # multi-stage BuildKit image recipe
+│       ├── assemble_sysroot.sh  # extracts 170+ target AArch64 CANN libraries and driver stubs
+│       └── verify.sh            # 15-point automated verification suite
+├── targets/
+│   ├── target-310p/             # native AArch64 inference (README.aarch64.md)
+│   └── target-950pr/            # native x86_64 Ascend 950PR (docs/target-950pr-x86_64.md)
+├── common/                      # logic shared by both targets
+│   ├── scripts/                 # fetchers, wheelhouse resolver, dev-shell launcher
+│   ├── docker/                  # reusable base stage, compiler environment, driver plumbing
+│   └── patches/                 # vendor script shims
 ├── deps/<target>/               # offline payload: CANN .run files, wheels, debs (git-ignored)
 ├── artifacts/                   # final deployable archives, Windows drive (git-ignored)
-├── download_deps.sh             # Idempotent downloader with SHA-256 integrity verification
-├── .dockerignore                # Context exclusion to prevent image layer bloat
-├── .gitattributes               # Enforces LF endings across all platforms
+├── download_deps.sh             # idempotent downloader with SHA-256 verification
+├── .dockerignore                # context exclusion, keeps multi-GB payloads out of image layers
+├── .gitattributes               # enforces LF endings across platforms
 └── README.md
+```
 
+Every target exposes the same four entry points:
+
+```text
+targets/<target>/provision.sh        stage the offline payload (the only networked step)
+targets/<target>/build.sh            build the image with --network=none
+targets/<target>/run_dev.sh          interactive shell in the built image
+targets/<target>/verify_runtime.sh   the image check suite, run as `docker run <image> verify`
 ```
 
 The build context for **every** image is the repository root, and every path
@@ -45,7 +57,7 @@ what belongs in each directory** and on the two rules that are easy to break by
 accident: `artifacts/` holds only final deployable archives, lives on the
 Windows workspace drive, and is kept out of both git and the Docker build
 context; `deps/` is provisioned, never committed, and declared per target by
-`docker/<target>/deps.manifest`.
+`targets/<target>/deps.manifest`.
 
 ---
 
@@ -64,7 +76,7 @@ context; `deps/` is provisioned, never committed, and declared per target by
 Grant execution permissions to the build and verification scripts:
 
 ```bash
-chmod +x download_deps.sh docker/builder-x86_64/*.sh
+chmod +x download_deps.sh builders/builder-x86_64/*.sh
 
 ```
 
@@ -89,11 +101,11 @@ This step pulls:
 
 ### 3. Build the Docker Image
 
-`docker/builder-x86_64/Dockerfile` uses BuildKit bind-mounts (`--mount=type=bind`) so large installer packages are never copied into the image layers.
+`builders/builder-x86_64/Dockerfile` uses BuildKit bind-mounts (`--mount=type=bind`) so large installer packages are never copied into the image layers.
 
 * **Standard Build (Host cross-compiler + Ascend C kernel compiler):**
 ```bash
-DOCKER_BUILDKIT=1 docker build -f docker/builder-x86_64/Dockerfile \
+DOCKER_BUILDKIT=1 docker build -f builders/builder-x86_64/Dockerfile \
   -t cann85-cross-310p:latest .
 
 ```
@@ -102,7 +114,7 @@ DOCKER_BUILDKIT=1 docker build -f docker/builder-x86_64/Dockerfile \
 * **Build with AArch64 LibTorch baked in (Recommended for `vllm-ascend` wheel builds):**
 ```bash
 DOCKER_BUILDKIT=1 docker build \
-  -f docker/builder-x86_64/Dockerfile \
+  -f builders/builder-x86_64/Dockerfile \
   --build-arg WITH_LIBTORCH=1 \
   -t cann85-cross-310p:latest .
 
@@ -187,7 +199,7 @@ cmake --build build -j$(nproc)
 ## Technical Notes & Gotchas
 
 * **CANN Version String:** Upstream Huawei OBS returns HTTP `403 Forbidden` on nonexistent keys. Use version `8.5.0` (not `8.5.RC1`).
-* **Makeself Extraction:** Inner packages fail if extraction target directories already exist. `docker/builder-x86_64/assemble_sysroot.sh` manages scratch directories dynamically.
+* **Makeself Extraction:** Inner packages fail if extraction target directories already exist. `builders/builder-x86_64/assemble_sysroot.sh` manages scratch directories dynamically.
 * **Symlink Resolution:** `assemble_sysroot.sh` uses `find \( -type f -o -type l \)` with `cp -aL` to dereference and preserve all shared object aliases (e.g. `libascend_protobuf.so`).
 * **Driver Link-Time Stubs:** Cross-linking host binaries against `libascendcl.so` requires device driver link stubs (`drvHdc*`, `hal*`) located under `${CANN_AARCH64_ROOT}/devlib/linux/aarch64/`.
 * **C++ Standard:** Ascend C headers (`kernel_operator.h`) require `-std=c++17`. Compiling with default C++11 will fail.
