@@ -327,16 +327,42 @@ far the largest product of this image — roughly **87 minutes** of the build,
 installed at `vllm_ascend/_cann_ops_custom/vendors/custom_transformer` with
 `libcust_opapi.so` alongside it. `verify_runtime.sh` now asserts its presence.
 
-`mla_prolog_v3` is among the 27, so **MLAPO is not excluded on this SoC** — the
-`MlaPrologV3_*` kernels are among the slowest to compile in the whole run. The
-ops actually built are listed in `build_aclnn.sh`'s `ascend950` branch:
-`moe_gating_top_k_hash`, `inplace_partial_rotary_mul`, `kv_compress_epilog`,
-`compressor`, `vllm_quant_lightning_indexer`, `kv_quant_sparse_attn_sharedkv`,
-`swiglu_group_quant`, `situ_mx_quant`, `causal_conv1d`,
-`recurrent_gated_delta_rule`, `recurrent_kda`, `chunk_fwd_o`,
-`chunk_gated_delta_rule_fwd_h`, `chunk_kda_fwd`, `kda_gate_cumsum`,
-`store_kv_block`, `k2q_csr`, `sparse_attention_score`, `mla_prolog_v3` and
-others.
+### The 27 ops, exactly as the build asks for them
+
+These are not inferred from reading `build_aclnn.sh`; they are the literal
+`--ops=` argument the `ascend950` branch passes to its inner `build.sh`, read
+off the process table of a running cold build:
+
+```
+build.sh --pkg --soc=ascend950 --ops=moe_gating_top_k_hash;inplace_partial_rotary_mul;
+kv_compress_epilog;compressor;compressor_metadata;vllm_quant_lightning_indexer;
+vllm_quant_lightning_indexer_metadata;kv_quant_sparse_attn_sharedkv;
+kv_quant_sparse_attn_sharedkv_metadata;hc_post;hc_pre;swiglu_group_quant;
+situ_mx_quant;indexer_compress_epilog_v2;causal_conv1d;recurrent_gated_delta_rule;
+recurrent_kda;chunk_fwd_o;chunk_gated_delta_rule_fwd_h;chunk_kda_fwd;
+kda_gate_cumsum;kda_layout_swap12;store_kv_block;store_kv_block_metadata;
+k2q_csr;sparse_attention_score;mla_prolog_v3
+```
+
+Twenty-seven names, and every one of them is compiled for this target. Two are
+worth calling out by their kernel spelling, because both were claimed to be
+absent at one point or another:
+
+* **`mla_prolog_v3` → `MlaPrologV3_*`.** MLAPO is **not** excluded on this SoC.
+  The `VLLM_ASCEND_CUSTOM_OP_EXCLUDE_ASCEND950` list drops
+  `mla_preprocess`/`batch_matmul_transpose` from the *`vllm_ascend_C` extension*
+  — a different operator on a different build path. The ACLNN `MlaPrologV3_*`
+  kernels are the slowest in the whole run; the last handful of them account for
+  roughly half of stage 6's wall time on their own.
+* **`chunk_kda_fwd` → `ChunkKdaFwd_*`.** The KDA (Kimi Delta Attention) family
+  — `chunk_kda_fwd`, `recurrent_kda`, `kda_gate_cumsum`, `kda_layout_swap12` —
+  is compiled here in full, alongside the gated-delta-rule and causal-conv1d
+  ops that share its code paths.
+
+Note the `*_metadata` entries (`compressor_metadata`,
+`vllm_quant_lightning_indexer_metadata`, `kv_quant_sparse_attn_sharedkv_metadata`,
+`store_kv_block_metadata`): they are counted among the 27 and produce their own
+kernel binaries, which is part of why 27 ops yield 493 of them.
 
 What remains true is that the **`vllm_ascend_C` extension** takes the same
 branch as the 310P, and that is what the gates below describe:
@@ -497,5 +523,8 @@ suite's contract requires — they are not silently passed:
   `SystemError: <built-in function get_arch> returned NULL`.
 
 So this image is proven *complete and self-consistent offline*. Proving the
-operators **execute** requires a 950; re-run `verify` there and the suite
-exercises both checks and reports 12/12.
+operators **execute** requires a 950; re-run `verify` there and both checks are
+exercised for real, taking the suite to **11/11**. Only one of the two adds a
+new assertion — the `vllm_ascend_C` import — because the `vllm` CLI check
+already counts on a build host, as "CLI on PATH", and merely gets stricter where
+a device exists.

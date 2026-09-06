@@ -5,7 +5,7 @@
 #   docker run --rm vllm-ascend-950pr:x86_64-offline verify
 #   docker run --rm --entrypoint verify-runtime.sh <image>
 #
-# Nine assertions, the same shape as the 310P suite in
+# Ten assertions, the same shape as the 310P suite in
 # targets/target-310p/verify_runtime.sh:
 #
 #   1 x86_64 architecture
@@ -16,10 +16,11 @@
 #   6 vllm_ascend_C built into the wheel
 #   7 vllm_ascend_C has no unresolved symbols beyond the Python C API
 #   8 no 310P stub symbols, i.e. no 310P gating patch leaked into this target
-#   9 vllm CLI present and `vllm serve --help` works
+#   9 ACLNN custom-op package installed under _cann_ops_custom
+#  10 vllm CLI present and `vllm serve --help` works
 #
-# A tenth assertion -- importing vllm_ascend_C itself -- is reachable only
-# where /dev/davinci* exists, so a build host sees 9/9 and an NPU host 10/10.
+# An eleventh assertion -- importing vllm_ascend_C itself -- is reachable only
+# where /dev/davinci* exists, so a build host sees 10/10 and an NPU host 11/11.
 #
 # Checks that genuinely need hardware are reported as INFO, never as failures,
 # so a clean run on a build host is not a claim that the NPU works -- only that

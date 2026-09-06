@@ -314,12 +314,14 @@ Build assets are partitioned by target; the orchestrators, the payload and the
 docs stay at the root because both images share them.
 
 ```text
-targets/target-310p/build.sh               preflight + buildx wrapper + docker save
-targets/target-310p/provision.sh      fills deps/ (the only networked step)
 download_deps.sh               shared installer downloader, SHA-256 verified
 
-targets/target-310p/            THIS image
+targets/target-310p/           THIS image
+  README.md                    the operator guide: provision, build, deploy, serve
   Dockerfile.aarch64           native AArch64 offline inference image
+  provision.sh                 stages deps/, the only networked step
+  build.sh                     preflight + buildx wrapper + docker save
+  run_dev.sh                   interactive shell in the built image
   entrypoint.sh                NPU detection + vllm serve launcher
   verify_runtime.sh            in-image verification suite
   packages.aarch64.txt         apt package list, shared by provisioning and build
@@ -328,9 +330,9 @@ targets/target-310p/            THIS image
   constraints.aarch64.txt      keeps the resolve on +cpu torch, off CUDA
   cann_extra.aarch64.txt       CANN libraries the toolkit .run omits
   patches/                     local fixes applied to vllm-ascend at build time
-  build.sh                     builds the image with --network=none
-  provision.sh                 stages deps/, the only networked step
-  run_dev.sh                   interactive shell in the built image
+
+targets/target-950pr/          the x86_64 Ascend 950 sibling, same four entry
+                               points, CANN 9.1.0, built natively
 
 common/                          shared by both targets, parameterised per target
   scripts/fetch.sh             resumable single-stream and chunked-range fetch

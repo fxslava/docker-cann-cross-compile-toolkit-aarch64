@@ -107,35 +107,50 @@ One forward-looking hint already present: vllm-ascend 0.13.0's `setup.py` maps
 `ascend910_9579` to device family `A5`, so the plugin anticipates a generation
 that this CANN does not yet build for.
 
-**That separate image now exists as a scaffold.** `targets/target-950pr/` targets
-a 950-class part on CANN **9.1.0** and x86_64, and [docs/target-950pr-x86_64.md](target-950pr-x86_64.md)
-carries its release matrix, its staging plan and the probe evidence that 9.1.0
-is the right line to pin. Two findings there change what this section implies:
+**That separate image now exists, and it builds.** `targets/target-950pr/`
+targets a 950-class part on CANN **9.1.0** and x86_64, natively rather than
+under emulation; it builds air-gapped in ~87 minutes and verifies 10/10 on a
+build host. [docs/target-950pr-x86_64.md](target-950pr-x86_64.md) carries its
+release matrix, its staging plan, the probe evidence that 9.1.0 is the right
+line to pin, and its measured results;
+[targets/target-950pr/README.md](../targets/target-950pr/README.md) is the
+operator guide. Three findings there change what this section implies:
 
 * The real SoC string is lowercase `ascend950dt_9582`, not `Ascend950PR`; every
   upstream gate is the case-sensitive CMake regex `SOC_VERSION MATCHES "ascend950"`.
-* `ascend950` is currently handled on the *same* branch as `ascend310p` in
-  vllm-ascend's CMake, so the 950 operator set is a subset today: the kernels
-  library is skipped and MLAPO is excluded. A 950 image is not automatically
-  the fuller one.
+* `ascend950` is handled on the *same* CMake branch as `ascend310p`, so
+  `ascendc_library(vllm_ascend_kernels)` is skipped and the image carries no
+  `libvllm_ascend_kernels.so`.
+* **But that gate governs only the kernels library.** `csrc/build_aclnn.sh`
+  takes its own `ascend950` branch and compiles **27 ACLNN custom ops into 493
+  kernel binaries**, `mla_prolog_v3` (MLAPO) and `chunk_kda_fwd` among them.
+  An earlier revision of this file said the 950 operator set was a subset with
+  MLAPO excluded; the build disproved it. The exclusion list it referred to
+  applies to the `vllm_ascend_C` extension, not to the ACLNN package — which is
+  the largest single product of the image.
 
 ---
 
 ## 3. The knobs, in one place
 
-| Knob | Where | 310P3 | 910B |
-|---|---|---|---|
-| `SOC_VERSION` | `Dockerfile.aarch64` `ARG` | `ascend310p3` | `ascend910b1`… |
-| `ASCEND_AICORE_ARCH` | `Dockerfile.aarch64` `ENV` | `dav-m200` | `dav-c220` |
-| device-family assert | `verify_runtime.sh` step 4 | `_310P` | `A2` |
-| kernel-exclusion patch | `targets/target-310p/patches/0001-…` | active | inert (gate does not match) |
-| `cann_extra` source image | `targets/target-310p/provision.sh` step 1b | `…:8.5.0-310p-…` | needs the 910b tag |
-| serving dtype | runtime `--dtype` | `float16` (forced) | bf16 or fp16 |
+| Knob | Where | 310P3 | 910B | 950 |
+|---|---|---|---|---|
+| CANN line | `provision.sh` / `build.sh` | `8.5.0` | `8.5.0` | **`9.1.0`** |
+| image platform | `build.sh` `--platform` | `linux/arm64` (emulated) | `linux/arm64` | **`linux/amd64` (native)** |
+| `SOC_VERSION` | target `Dockerfile` `ARG` | `ascend310p3` | `ascend910b1`… | `ascend950dt_9582` |
+| `ASCEND_AICORE_ARCH` | target `Dockerfile` `ENV` | `dav-m200` | `dav-c220` | `dav-v300` |
+| device-family assert | `verify_runtime.sh` | `_310P` | `A2` | `A5` |
+| kernel-exclusion patch | `targets/target-310p/patches/0001-…` | active | inert (gate does not match) | none — upstream builds unmodified |
+| `cann_extra` source image | target `provision.sh` | `…:8.5.0-310p-…` | needs the 910b tag | `…:9.1.0-950-ubuntu22.04-py3.10` |
+| ACLNN custom ops | `csrc/build_aclnn.sh` | not built | not built | **27 ops / 493 kernels** |
+| serving dtype | runtime `--dtype` | `float16` (forced) | bf16 or fp16 | checkpoint's own |
 
-A retarget is therefore mostly mechanical, with two things that are *not*
+A retarget is therefore mostly mechanical, with three things that are *not*
 mechanical and need a human decision: which CANN image `cann_extra` comes from,
-and making the `verify_runtime.sh` device-family assertion target-aware rather
-than hardcoded.
+making the `verify_runtime.sh` device-family assertion target-aware rather than
+hardcoded, and — as the 950 showed — checking what the plugin's *other* build
+paths do for the new SoC rather than reading one CMake gate and generalising
+from it.
 
 ---
 
