@@ -11,8 +11,10 @@
 #   DEPS_DIR     offline payload (default $CONTEXT/deps/950pr-x86_64)
 #   DEV_NETWORK  docker network  (default none)
 #
-# The shell is x86_64 native. A build host reaches 10/10 in the verify suite;
-# the two device-bound checks need /dev/davinci* and report [INFO] without it.
+# The shell is x86_64 native. A build host reaches 13/13 in the verify suite;
+# the device-bound checks need /dev/davinci* and report [INFO] without it. On a
+# 950PR with the driver mounted the suite is 14/14, and pyACL tightens there
+# from "resolves on sys.path" to "imports".
 # Behaviour, mounts and the NPU passthrough rules are in common/scripts/run_dev.sh.
 set -euo pipefail
 

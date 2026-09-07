@@ -7,41 +7,93 @@
 # enforced rather than merely written down.
 #
 # Format:  kind | path relative to DEPS_DIR | bytes | sha256 | source
-#   kind    file | dir | glob
+#   kind    file | dir | glob | pin
 #   bytes   0 means "not size-checked" (directories, and sets whose size
 #           depends on the resolve)
-#   sha256  '-' means UNPINNED. Sizes were measured with HTTP range requests
-#           against the live bucket on 2026-09-05. The two CANN hashes below
-#           are no longer '-': they are pinned from the first fully verified
-#           fetch (2026-09-05, both files downloaded to their exact expected
-#           byte count), the way download_deps.sh already does for the 8.5.0
-#           artefacts. The wheelhouse and apt rows stay unpinned because their
-#           contents depend on the resolve.
+#   sha256  '-' means UNPINNED. The wheelhouse and apt rows stay unpinned
+#           because their contents depend on the resolve.
 #
-# CANN 9.1.0 IS THE PINNED LINE, and it is real: probing the Huawei OBS bucket
-# the way download_deps.sh documents returns 206 for 9.0.0 and 9.1.0 and 403
-# ("no such version string") for 8.6.x, 9.0.RC1, 9.1.RC1, 9.2.0 and 9.5.0.
-# quay.io/ascend/cann publishes matching 9.1.0-950-* images, and upstream
-# vllm-ascend's Dockerfile.a5 builds on 9.1.0-950-ubuntu22.04-py3.12.
+# @CANN_VERSION@ AND @CANN_APT_VERSION@ ARE EXPANDED BY build.sh before this
+# file is parsed, so one manifest covers every CANN line this target can build.
+# The two are NOT interchangeable:
+#
+#   @CANN_VERSION@      the release LINE - 9.2.0. What CANN calls itself on disk.
+#   @CANN_APT_VERSION@  the exact Debian version - 9.2.0-beta.2. What apt pinned,
+#                       and therefore what the staged filenames carry.
+#
+# `pin` ROWS ARE VERSION-SCOPED INTEGRITY PINS and are the one place a literal
+# version still appears - necessarily, since a hash is per artefact:
+#
+#   pin | <cann-apt-version> | <filename> | <bytes> | <sha256>
+#
+# build.sh applies only the rows whose version equals $CANN_APT_VERSION - the
+# PACKAGE version, not the line, because 9.2.0-beta.1 and 9.2.0-beta.2 are
+# different artefacts of the same line and share no hashes. A version with no
+# pin row is size-checked but not hash-checked, with a warning; run
+# `./targets/target-950pr/provision.sh cann`, which prints the sha256 of what it
+# staged, and add the rows.
+#
+# WHERE CANN COMES FROM NOW (probed 2026-09-07):
+#   DevCloud apt  https://ascend.devcloud.huaweicloud.com/cann/debian, suite
+#                 `cann`, component `main`. GPG-signed; Huawei's cann-keyring
+#                 package registers the key and the sources.list entry. Carries
+#                 ascend-cann-{toolkit,nnal,950-ops,910-ops,910b-ops,310p-ops,
+#                 310b-ops,A3-ops} from 8.5.0 through 9.2.0-beta.2, for amd64
+#                 and arm64. THIS IS THE SOURCE.
+#   OBS bucket    the previous source, and it never carried 9.2.0: 206 for
+#                 9.0.0 and 9.1.0, 403 for every 9.2.0 spelling tried. Also had
+#                 no Ascend-cann-kernels-950 at all, which is why this target
+#                 used to lift operator libraries out of a vendor image.
+#   quay.io       ascend/cann's 950 images stop at the 9.1.0 line, so there is
+#                 no 9.2.0 vendor image to lift anything from - see cann_extra
+#                 below, which is now optional for exactly that reason.
+#
 # ---------------------------------------------------------------------------
 
-# --- CANN 9.1.0, x86_64 ----------------------------------------------------
-file|Ascend-cann-toolkit_9.1.0_linux-x86_64.run|1298337341|69e52e49a5ac1dde756a0d72077e36df7382b37cd3e1d78005d9cdbf699aeafc|https://ascend-repo.obs.cn-east-2.myhuaweicloud.com/CANN/CANN%209.1.0/Ascend-cann-toolkit_9.1.0_linux-x86_64.run
-file|Ascend-cann-nnal_9.1.0_linux-x86_64.run|572750476|1a743a0957a77a0624c2ecfdf689b5c5937a9097fda1e3b3e8e0191a7d11c694|https://ascend-repo.obs.cn-east-2.myhuaweicloud.com/CANN/CANN%209.1.0/Ascend-cann-nnal_9.1.0_linux-x86_64.run
+# --- CANN @CANN_APT_VERSION@, x86_64, from the DevCloud apt repository ------
+# Downloaded by `provision.sh cann` with apt itself, so the repository's GPG
+# signature is what authenticates them. The filenames are the ones apt gives a
+# downloaded archive (<pkg>_<version>_<arch>.deb), which is NOT the name the
+# file has on the repository.
+#
+# Each package wraps the vendor's own .run installer; the Dockerfile extracts
+# and runs it rather than letting dpkg do it, because the postinst omits
+# --quiet and stops on the EULA. See stage 3 of Dockerfile.x86_64.
+dir|cann_debs|0|-|apt-get install --download-only inside ubuntu:22.04
+file|cann_debs/ascend-cann-toolkit_@CANN_APT_VERSION@_amd64.deb|0|-|DevCloud apt repo, ascend-cann-toolkit=@CANN_APT_VERSION@
+file|cann_debs/ascend-cann-950-ops_@CANN_APT_VERSION@_amd64.deb|0|-|DevCloud apt repo, ascend-cann-950-ops=@CANN_APT_VERSION@
+file|cann_debs/ascend-cann-nnal_@CANN_APT_VERSION@_amd64.deb|0|-|DevCloud apt repo, ascend-cann-nnal=@CANN_APT_VERSION@
 
-# --- CANN runtime libraries the standalone toolkit omits -------------------
-# The public 9.1.0 toolkit is an incomplete slice of a CANN install: its lib64
-# holds 150 shared objects against the 176 in Huawei's own image for this SoC.
-# Three of the missing twenty-six are load-bearing - libopapi.so (vllm-ascend
-# links -lopapi for every SoC), libopapi_math.so (the compiled custom-ops
-# package will not install without it) and libhccl.so (torch_npu's DT_NEEDED).
-# No published .run carries them: kernels-{950,a5,910b} and nnrt all return 403.
-# They are lifted out of the vendor image's layer blob instead - the same route
-# the 310P used for libhccl.so on CANN 8.5.0.
-dir|cann_extra/lib64|0|-|quay.io/ascend/cann:9.1.0-950-ubuntu22.04-py3.10 layer blob
-file|cann_extra/lib64/libopapi.so|0|-|same layer
-file|cann_extra/lib64/libopapi_math.so|0|-|same layer
-file|cann_extra/lib64/libhccl.so|0|-|same layer
+# Integrity pins, applied only for the matching CANN_APT_VERSION. These three
+# are from the first verified fetch (2026-09-07) and each one was checked
+# against the SHA256 the repository's own signed Packages index publishes for
+# it, so the pin agrees with the vendor's index rather than merely with
+# whatever arrived down the wire.
+pin|9.2.0-beta.2|cann_debs/ascend-cann-toolkit_9.2.0-beta.2_amd64.deb|1395916760|d9b09d75248406750baff4f93f8bca05c4eeb2ba7cc26052191add73f130c4da
+pin|9.2.0-beta.2|cann_debs/ascend-cann-950-ops_9.2.0-beta.2_amd64.deb|2834051262|c723b3aae658c6919277e77fbaaaacd4d64163892d701e53a0a40a52442473b7
+pin|9.2.0-beta.2|cann_debs/ascend-cann-nnal_9.2.0-beta.2_amd64.deb|440036476|b917d8867508e550ffb6df7966a53d8b815b2a3afc0553940163a9404007689b
+
+# --- cann_extra: the pre-apt workaround, now an escape hatch ---------------
+# HISTORY, BECAUSE THE DIRECTORY STILL EXISTS AND ITS NAME EXPLAINS NOTHING.
+# The standalone toolkit .run was an incomplete slice of a CANN install:
+# measured on 9.1.0 its lib64 held 150 shared objects against the 176 in
+# Huawei's own image for this SoC. Three of the missing twenty-six were
+# load-bearing - libopapi.so (vllm-ascend links -lopapi for every SoC),
+# libopapi_math.so (the compiled custom-ops package will not install without
+# it) and libhccl.so (torch_npu's DT_NEEDED) - and NO published .run carried
+# them, because Ascend-cann-kernels-950 returned 403 from the OBS bucket like
+# everything else 950-shaped. They were lifted out of a vendor container's
+# layer blob instead.
+#
+# THE FILE ROWS ARE GONE AND THE DIRECTORY MAY BE EMPTY. ascend-cann-950-ops
+# is the operator package whose absence created this workaround; now that it is
+# installable from the apt repository, the libraries it carries come from the
+# release's own package instead of from a container image of a DIFFERENT
+# release. cann_extra is kept as an escape hatch for a release whose ops package
+# is missing something, and the Dockerfile copies whatever is here - but it
+# asserts on the OUTCOME (libopapi.so present in the toolkit's lib64 after the
+# ops install), not on the source, so an empty directory is a pass.
+dir|cann_extra/lib64|0|-|optional; ascend-cann-950-ops normally supplies these
 
 # --- vllm-ascend ACLNN third-party archives --------------------------------
 # csrc/build_aclnn.sh builds 27 custom ops on the ascend950 branch and its
@@ -88,8 +140,17 @@ glob|python_wheels/vllm-0.27.1*.whl|0|-|built from source, VLLM_TARGET_DEVICE=em
 # Staged from the codeload tarball rather than a git clone: the Dockerfile
 # deletes .git anyway (setuptools-scm is fed VLLM_ASCEND_VERSION), and a
 # depth-1 clone over the git protocol cannot resume a dropped connection.
-file|src/vllm-ascend/setup.py|0|-|https://codeload.github.com/vllm-project/vllm-ascend/tar.gz/refs/heads/main
+#
+# THE REF IS PINNED, and it is no longer `main`. main moves under you, so two
+# provisioning runs a day apart produced different images from an unchanged
+# repository - and the Dockerfile stamped a fixed SETUPTOOLS_SCM_PRETEND_VERSION
+# on whatever arrived. provision.sh now fetches releases/v0.27.1rc by commit
+# (VLLM_ASCEND_COMMIT), the branch upstream cuts against vLLM v0.27.1, which is
+# already this target's VLLM_REF. src/vllm-ascend/.provenance records exactly
+# what was staged.
+file|src/vllm-ascend/setup.py|0|-|codeload vllm-ascend tar.gz at $VLLM_ASCEND_COMMIT
 file|src/vllm-ascend/requirements.txt|0|-|same checkout
+file|src/vllm-ascend/.provenance|0|-|written by provision.sh: repo, ref, commit, timestamp
 
 # The catlass submodule, which a tarball does NOT carry - it ships the empty
 # directory only. csrc/build_aclnn.sh takes the ascend950 branch, calls
@@ -98,4 +159,19 @@ file|src/vllm-ascend/requirements.txt|0|-|same checkout
 # and takes the vllm-ascend wheel build with it. Staging include/ is enough,
 # because the script skips the fetch when it is already there. The commit is
 # pinned by vllm-ascend's own .gitmodules, not chosen here.
-dir|src/vllm-ascend/csrc/third_party/catlass/include|0|-|https://gitcode.com/cann/catlass.git @ .gitmodules commit
+#
+# THE PIN IS HONOURED BUT THE TREE IS PATCHED, ON CANN 9.2.0. .gitmodules pins
+# 41bf90da655b, and that commit does not compile against 9.2.0-beta.2's Bisheng:
+# the compiler now requires __attribute__((cce_simd_vf)) functions to be free or
+# static, and catlass declares fourteen of them as non-static members. Three ops
+# fail as a result - ChunkFwdO, ChunkGatedDeltaRuleFwdH, ChunkKdaFwd.
+#
+# Moving the pin forward to upstream's fix (c89fe73d) was tried and does NOT
+# work: upstream deleted include/catlass/debug.hpp before that commit, and
+# vllm-ascend at this ref still includes it, so no single catlass commit
+# satisfies both. provision.sh therefore stages the pinned commit and applies
+# targets/target-950pr/patches/0001-catlass-simd-vf-static.patch - c89fe73d's
+# semantic change and nothing else. .provenance records the commit, what
+# .gitmodules asked for, and which patch was applied.
+dir|src/vllm-ascend/csrc/third_party/catlass/include|0|-|https://gitcode.com/cann/catlass.git @ .gitmodules commit, + the simd_vf backport
+file|src/vllm-ascend/csrc/third_party/catlass/.provenance|0|-|written by provision.sh: url, commit, gitmodules_commit, patch

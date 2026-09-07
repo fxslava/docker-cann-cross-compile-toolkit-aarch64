@@ -7,14 +7,18 @@
 # vLLM 0.27.1 declares requires-python >=3.10,<3.15, so nothing is given up by
 # staying on the distribution's own interpreter.
 #
-# Every pin below is read out of vllm-project/vllm-ascend@main, not chosen
+# Every pin below is read out of vllm-project/vllm-ascend at the ref this target
+# pins (releases/v0.27.1rc @ e61a5d7, see provision.sh), not chosen
 # here: requirements.txt + pyproject.toml pin the torch stack, and
 # Dockerfile.a5 (the upstream 950/A5 reference image) pins vLLM and
 # triton-ascend. Re-read them before bumping any single line - this set moves
 # together or not at all, exactly like the 310P matrix.
 #
-#   upstream ref     vllm-ascend@main, Dockerfile.a5
-#   CANN             9.1.0
+#   upstream ref     vllm-ascend releases/v0.27.1rc, Dockerfile.a5
+#   CANN             $CANN_VERSION, default 9.2.0. Upstream's Dockerfile.a5
+#                    still says 9.1.0 because it builds FROM a published
+#                    quay.io/ascend/cann image; this target installs the
+#                    toolkit from a .run and is not bound to that.
 #   base image there quay.io/ascend/cann:9.1.0-950-ubuntu22.04-py3.12
 #                    (Huawei also publishes -py3.10 and -py3.11 of that tag;
 #                    this image is the 3.10 line, on plain ubuntu:22.04)
@@ -48,6 +52,32 @@ cmake>=3.26
 pybind11
 
 # --- torch stack, pinned as a set ------------------------------------------
+#
+# torch_npu IS THE PIN THAT MOVES WITH CANN, and it is the one this file cannot
+# derive on its own when CANN_VERSION changes. Read this before bumping either.
+#
+# The pins below are upstream's, verbatim: vllm-ascend @ releases/v0.27.1rc
+# declares torch==2.10.0 and torch-npu==2.10.0.post4 in BOTH requirements.txt
+# (lines 16-17) and pyproject.toml's build-system requires (lines 21-22), and
+# its Dockerfile.a5 pairs that set with CANN 9.1.0.
+#
+# torch_npu's OWN published compatibility matrix does not help here. It is on
+# the 8.x CANN numbering and stops at:
+#     CANN 8.5.0 -> PyTorch 2.12.0 -> torch_npu 2.12.0rc1
+# with no CANN 9.x row at all. The 950/A5 line is newer than that table, so the
+# only authority for a CANN 9.x pairing is vllm-ascend's own pins.
+#
+# CONSEQUENCE FOR A 9.2.0 BUILD: there is no published torch_npu documented as
+# pairing with CANN 9.2.0, because there is no published CANN 9.2.0 (see
+# docs/target-950pr-x86_64.md §1a). PyPI carries 2.10.0.post6, 2.11.0 and
+# 2.12.0 as well, and picking one of those by "it is newer, so it must match"
+# is exactly the guess that produces `undefined symbol` at `import torch_npu`.
+# When the vendor drop arrives, take the pairing from ITS release notes, or
+# from a vllm-ascend ref whose Dockerfile.a5 names that CANN version - and move
+# torch, torchvision, torchaudio and triton-ascend with it, since upstream
+# treats them as one set. Note that Dockerfile.a5's daily-build stage carries
+# ARG TORCH_NPU_VERSION / TORCH_NPU_DATE precisely because a pre-release CANN
+# needs a torch_npu built against it.
 torch==2.10.0
 torch-npu==2.10.0.post4
 torchvision==0.25.0

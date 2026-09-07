@@ -3,11 +3,20 @@
 A `linux/amd64` offline inference image for Ascend 950-class silicon (Atlas
 350, DaVinci v3, device family **A5**), built natively on an x86_64 host.
 
-**Status: built and verified.** `deps/950pr-x86_64/` was staged in full (3.8 GB)
-and the image was built natively on x86_64 with `--network=none`, then verified
-inside the container: **10/10 checks pass on a build host**, with the
-hardware-only checks reported as `[INFO]` rather than counted. See §7 for the
-measured numbers and §5 for what the operator set actually turned out to be.
+**Status: the CANN 9.1.0 image is built and verified; the CANN 9.2.0 default is
+staged for but not yet built.**
+
+* **9.1.0** — `deps/950pr-x86_64/` was staged in full (3.8 GB) and the image was
+  built natively on x86_64 with `--network=none`, then verified inside the
+  container: **10/10 checks pass on a build host** (13/13 under the extended
+  suite described in §8), with the hardware-only checks reported as `[INFO]`
+  rather than counted. See §7 for the measured numbers and §5 for the operator
+  set. Reproduce it with `CANN_VERSION=9.1.0 ./targets/target-950pr/build.sh`.
+* **9.2.0** — now the default, because that is what the 950PR host runs. The
+  pipeline is fully wired for it, but **no CANN 9.2.0 has been published**
+  anywhere reachable (§1), so the toolkit and NNAL installers have to come from
+  a vendor drop before the build can run. Everything downstream of that is in
+  place and tested; §8.7 has the exact remaining steps.
 
 Building it exposed six things that the scaffold had assumed away, all of them
 now fixed in this repo rather than worked around locally — the most consequential
@@ -21,7 +30,7 @@ The two differ in more than the SoC:
 |---|---|---|
 | Image architecture | `linux/arm64`, QEMU-emulated at build time | `linux/amd64`, **native** |
 | Base OS / Python | Ubuntu 22.04 / 3.10 | Ubuntu 22.04 / 3.10 |
-| CANN | 8.5.0 | 9.1.0 (+ NNAL/ATB) |
+| CANN | 8.5.0 | `$CANN_VERSION`, default 9.2.0 (+ NNAL/ATB) |
 | Unpacker stage | needed, to dodge the emulation tax | **none** — installer runs natively |
 | `ldconfig` stub | needed, `qemu-user` segfaults | **none** |
 | Local patches | 1, for bf16/`PIPE_FIX` kernel gating | **none**, by design |
@@ -29,7 +38,7 @@ The two differ in more than the SoC:
 
 ---
 
-## 1. Why CANN 9.1.0, and how that was established
+## 1. Which CANN release, and how that is established
 
 [docs/soc-build-matrix.md §2](soc-build-matrix.md) already showed that CANN
 8.5.0 cannot build for this SoC at all: zero files in the toolkit mention
@@ -62,20 +71,191 @@ required: upstream sources `nnal/atb/set_env.sh` before building vllm-ascend.
 `Ascend-cann-kernels-950_9.1.0_*` and `-nnrt_` return 403 — those keys do not
 exist under those names, so do not plan around them.
 
+### 1a. CANN 9.2.0 **is** published — on the DevCloud apt repository
+
+**This section previously concluded the opposite, and it was looking in the
+wrong place.** The earlier probes were of the OBS bucket and the container
+registries, and those findings still hold: re-probed 2026-09-07, the OBS bucket
+answers 403 for every 9.2.0 spelling tried (`9.2`, `9.2.0`, `9.2.RC1`,
+`9.2.0.RC1`, `9.2.0.alpha001`, `9.2.0.alpha002`, `9.2.T1`) while 9.0.0 and 9.1.0
+answer 206; `quay.io/ascend/cann` tops out at the 9.1.0 line across all 517
+tags, Docker Hub `ascendai/cann` agrees, and `vllm-ascend` still pins
+`CANN_VERSION="9.1.0"` in `Dockerfile.a5` on both `main` and
+`releases/v0.27.1rc`.
+
+What none of those probes covered is Huawei's **Debian package repository**,
+which is a separate distribution channel and does carry the 9.2.0 line:
+
+```
+https://ascend.devcloud.huaweicloud.com/cann/debian
+```
+
+Probed 2026-09-07:
+
+| Property | Value |
+|---|---|
+| Suites | `cann`, `hdk` — both component `main` |
+| Architectures | `all`, `amd64`, `arm64` |
+| Signing | GPG. `cann-keyring_1.0.0_all.deb` installs the key at `/usr/share/keyrings/cann-archive-keyring.gpg` and writes `/etc/apt/sources.list.d/ascend-cann.list` |
+| Releases carried | 8.5.0, 9.0.0, 9.0.0-beta.2, 9.0.1, 9.1.0, 9.1.0-beta.1, 9.1.0-beta.3, 9.1.1, 9.2.0-beta.1, **9.2.0-beta.2** |
+| Packages | `ascend-cann-{toolkit,nnal,950-ops,910-ops,910b-ops,310p-ops,310b-ops,A3-ops}` |
+
+Two details matter and neither is obvious:
+
+* **`main` indexes every release.** The per-version components (`9.2.0-beta.2/`
+  and friends) exist, but the keyring enables only `cann main`, and that one
+  component's `Packages` lists all ten releases. So `apt-cache policy
+  ascend-cann-toolkit` shows ten candidate versions and the `=<version>` pin is
+  what selects one. An unpinned install silently follows the newest beta.
+* **`ascend-cann-950-ops` exists here and existed nowhere else.** This is the
+  Ascend950 operator payload — 2.8 GB — whose absence from the OBS bucket
+  (`Ascend-cann-kernels-950` → 403) is the entire reason this repo used to lift
+  26 libraries out of a vendor container's layer blob. See §1b.
+
+So `provision.sh cann` now installs the keyring into a staging container and
+downloads with apt itself, which means the repository's **signature** is what
+authenticates the payload rather than the fact that it arrived over TLS. The
+`vendor/cann-<version>/cann_debs/` drop survives for a site that cannot reach
+the repository at all from its staging host.
+
+### 1b. The packages are `.run` wrappers, and `dpkg -i` does not work
+
+Each `.deb` is thin: its `data.tar` holds exactly **one** file, the vendor's own
+`Ascend-cann-*_<version>_linux-x86_64.run`, and its `postinst` runs
+
+```
+${RUN} --install --install-path="/usr/local/Ascend" --force --nox11 --install-for-all
+```
+
+then deletes it. That cannot be used in a container build, for two independent
+reasons — both measured, not inferred:
+
+1. **No `--quiet`, so it stops on the EULA.** The installer prints the licence
+   and waits for input. In `docker build` there is none, so it exits 1 and dpkg
+   reports `post-installation script subprocess returned error exit status 1`
+   with `/usr/local/Ascend` left **empty**. The vendor's own documented flag for
+   scripted installs is `--quiet`, whose help text says using it constitutes
+   acceptance of the EULA.
+2. **`--install` is *run* mode.** From the installer's `--help`:
+   `--install | --devel | --full   Install run | devel | full mode`. Only
+   `--full` installs `pyACL_<version>_linux-x86_64.run` and the development
+   payload. An image built from run mode fails at `import acl` on the inference
+   path (`vllm_ascend/device_allocator/camem.py:27` imports it at module scope),
+   which is a runtime failure, not a build failure.
+
+Dockerfile stage 3 therefore takes the `.run` back out of the `.deb` with
+`dpkg-deb --fsys-tarfile` and drives it directly. The scene differs per package
+and the three installers do **not** share an option grammar:
+
+| Package | Scene | Notes |
+|---|---|---|
+| `ascend-cann-toolkit` | `--full` | `--install \| --devel \| --full` |
+| `ascend-cann-950-ops` | `--install` | `--install \| --devel` only. **There is no `--full`** — passing one makes the installer print its usage and exit **0**, which is success-shaped and installs nothing |
+| `ascend-cann-nnal` | `--install` | scenes are install/upgrade/uninstall; no scene at all is rejected outright |
+
+The payload is unchanged by this: the bytes are the vendor's, GPG-verified by
+apt at staging time and SHA-256 pinned in `deps.manifest` against the hashes the
+repository's own signed `Packages` index publishes. Only the *scene* is chosen
+by the Dockerfile rather than by a `postinst` that cannot run unattended.
+`/usr/local/Ascend/.cann-provenance` records the repository, the exact apt
+version and each package's hash, since `dpkg -l` knows nothing about them.
+
+### 1c. The 9.2.0 install produces the **vendor** layout
+
+Measured on 9.2.0-beta.2, the toolkit installer lays down:
+
+```
+/usr/local/Ascend/cann-9.2.0-beta.2            the real tree
+/usr/local/Ascend/cann                      -> cann-9.2.0-beta.2
+/usr/local/Ascend/ascend-toolkit/latest     -> /usr/local/Ascend/cann
+/usr/local/Ascend/ascend-toolkit/set_env.sh -> …/latest/set_env.sh
+```
+
+Three consequences:
+
+* The real directory is named with the **package** version, betas included —
+  `cann-9.2.0-beta.2`, not `cann-9.2.0`. Nothing should hardcode either.
+* The old stage-3c loop, which did `ln -sfn ascend-toolkit/latest` at `cann`,
+  would have produced `cann -> ascend-toolkit/latest -> cann`: an **ELOOP** that
+  every path through the image then fails on. It now resolves the target with
+  `readlink -f` first and links every name to the real directory.
+* A plain `find` over `ascend-toolkit/` no longer finds
+  `ascend_toolkit_install.info`, because that directory holds only symlinks — so
+  the version assertion uses `find -L`. Without it the assertion silently
+  degrades to a warning.
+
+**Before assuming 9.2.0 is what you need**, read the host rather than the
+deployment note — the driver (Ascend HDK, e.g. `25.0.rc1`) and the CANN toolkit
+are separately versioned, and "the host runs 9.2.0" is often a report of one
+when the other is meant:
+
+```bash
+cat /usr/local/Ascend/ascend-toolkit/latest/x86_64-linux/ascend_toolkit_install.info
+cat /usr/local/Ascend/driver/version.info
+npu-smi info -t board -i 0
+```
+
+---
+
+### 1d. catlass does not compile on 9.2.0, and the pin cannot just be moved
+
+The ascend950 ACLNN op build pulls in `catlass`, vllm-ascend's third-party
+submodule. CANN 9.2.0's Bisheng requires `__attribute__((cce_simd_vf))`
+functions to be free or **static**; catlass at the pinned commit declares
+fourteen as non-static members, so `ChunkFwdO`, `ChunkGatedDeltaRuleFwdH` and
+`ChunkKdaFwd` fail to build:
+
+```
+block_epilogue_fa_softmax_ascend950.hpp:329:5: error: simd_vf function
+    'ComputeExpSubSum' must be a free function or static member function
+ld.lld: error: cannot open .../kernel_meta/ChunkFwdO_..._mix_aic_0.o
+```
+
+The second line is the one that shows up first in a scan of the log, and it is a
+red herring: the object is missing because the compile failed, not because of
+anything about linking.
+
+Upstream fixed it in `c89fe73d`, but deleted `include/catlass/debug.hpp` before
+that commit — and vllm-ascend at this ref includes that header. Measured on all
+three candidates:
+
+| catlass commit | `simd_vf` static | `debug.hpp` | builds on 9.2.0? |
+|---|---|---|---|
+| `41bf90da` (`.gitmodules`) | ✗ | ✓ | no — `simd_vf` errors |
+| `c89fe73d` (the fix) | ✓ | ✗ | no — `debug.hpp` not found |
+| `337cc892` (master) | ✓ | ✗ | no — `debug.hpp` not found |
+
+`41bf90da` is an ancestor of master, so the history is linear and the deletion
+genuinely precedes the fix. A cherry-pick of `c89fe73d` onto the pin conflicts in
+every file it touches — an intervening `pre-commit` reformat, plus a dozen files
+absent at the pin.
+
+So the change is backported:
+`targets/target-950pr/patches/0001-catlass-simd-vf-static.patch`, 11 lines over 4
+headers, applied by `provision.sh` at staging time. In-class declarations only —
+C++ forbids `static` on the three out-of-class definitions in
+`block_epilogue_per_group_per_block.hpp`, and upstream's post-fix file agrees.
+
+`provision.sh` dry-runs the patch and refuses to stage a payload it cannot apply
+to; both it and `build.sh` then assert that **no** non-static `__simd_vf__`
+members remain, because the alternative is discovering it forty minutes into a
+kernel compile.
+
 ---
 
 ## 2. The release matrix
 
-Read out of `vllm-ascend@main` (`requirements.txt`, `pyproject.toml`) and its
-`Dockerfile.a5`. It moves as a set:
+Read out of `vllm-ascend @ releases/v0.27.1rc` (`requirements.txt`,
+`pyproject.toml`) and its `Dockerfile.a5`. It moves as a set:
 
 | Component | Pin | Source |
 |---|---|---|
-| CANN | 9.1.0 | Huawei OBS bucket |
-| CANN NNAL (ATB) | 9.1.0 | same bucket |
+| CANN | `$CANN_VERSION` 9.2.0 / `$CANN_APT_VERSION` 9.2.0-beta.2 | DevCloud apt repository, or `vendor/cann-<v>/cann_debs/` (§1a) |
+| CANN Ascend950 ops | same release | same source — `ascend-cann-950-ops` (§1a) |
+| CANN NNAL (ATB) | same release | same source |
 | Python | 3.10 | jammy system interpreter |
 | vLLM | v0.27.1 | **built from source**, `VLLM_TARGET_DEVICE=empty` |
-| vllm-ascend | `main` | no tagged release carries the A5 gates yet |
+| vllm-ascend | `releases/v0.27.1rc` @ `e61a5d7` | the branch upstream cuts against vLLM v0.27.1; pinned by commit, not by branch head (§8.5) |
 | torch | 2.10.0**+cpu** | download.pytorch.org/whl/cpu |
 | torch_npu | 2.10.0.post4 | PyPI |
 | torchvision / torchaudio | 0.25.0+cpu / 2.10.0+cpu | download.pytorch.org/whl/cpu |
@@ -150,11 +330,11 @@ docker buildx build \
 | ARG | Default | Notes |
 |---|---|---|
 | `BASE_IMAGE` | `ubuntu:22.04` | jammy, the base upstream builds on — see §6 |
-| `CANN_VERSION` | `9.1.0` | selects both `.run` filenames |
+| `CANN_VERSION` | `9.2.0` | selects both `.run` filenames, the `cann_extra` vendor tag, the `cann-<v>` symlink and the in-image `ENV`; asserted against the installed toolkit (§8.1) |
 | `SOC_VERSION` | `ascend950dt_9582` | **lowercase, see below** |
-| `ASCEND_AICORE_ARCH` | `dav-v300` | **unverified, see §6** |
+| `ASCEND_AICORE_ARCH` | `dav-c310` | **corrected — was `dav-v300`, which exists in no CANN file; see §8.8** |
 | `COMPILE_CUSTOM_KERNELS` | `1` | |
-| `VLLM_ASCEND_VERSION` | `0.26.0` | `setuptools-scm` pretend-version |
+| `VLLM_ASCEND_VERSION` | `0.27.1` | `setuptools-scm` pretend-version; must match the provisioned ref (§8.5) |
 
 ### `SOC_VERSION` is lowercase, and it is not `Ascend950PR`
 
@@ -452,19 +632,12 @@ each for a reason that would otherwise cause a silent failure:
 
 Unverified, and honestly so:
 
-* **`ASCEND_AICORE_ARCH=dav-v300`.** This repo has never had a CANN 9.x payload
-  on disk. What *is* known is that vllm-ascend maps `ascend950` to kernel
-  directory `arch35` (`csrc/CMakeLists.txt`, `ARCH_DIRECTORY_LIST`), which is
-  not the same statement. Confirm against the toolkit before trusting a kernel
-  build:
-
-  ```bash
-  grep -nE '^set\((ascend|kirin)[a-z0-9_]*_list' \
-    <toolkit>/ascendc_kernel_cmake/legacy_modules/host_config.cmake
-  ```
-
-  `targets/target-950pr/build.sh` runs that check automatically when it finds an
-  extracted toolkit under the payload directory, and says so when it cannot.
+* ~~**`ASCEND_AICORE_ARCH=dav-v300`.**~~ **Resolved — it was wrong. See §8.8.**
+  Checked against a real CANN 9.1.0 toolkit: `dav-v300` appears in no file at
+  all, and every Ascend950 platform config says `CCEC_AIC_version=dav-c310-cube`.
+  The value is now `dav-c310`. `targets/target-950pr/build.sh` still runs its
+  `ascend950_list` probe automatically when it finds an extracted toolkit under
+  the payload directory, and says so when it cannot.
 * ~~**PEP 668 handling.**~~ **No longer a concern on this base.** Jammy ships
   no `/usr/lib/python3.10/EXTERNALLY-MANAGED` marker (checked in the
   container), so pip installs into the system interpreter unmodified — which is
@@ -539,6 +712,11 @@ in-image assertion that no `nvidia-*` distribution is installed and that
 
 ### What 10/10 does and does not mean
 
+**These numbers are the suite as it stood when the 9.1.0 image was measured.**
+§8.4 added three assertions since — the CANN release match, the toolkit-path
+sweep and pyACL — so the same image re-verified today reads 13/13 on a build
+host and 14/14 on a 950. The reasoning below is unchanged; only the totals moved.
+
 Two checks are reported as `[INFO]` because they need silicon, exactly as the
 suite's contract requires — they are not silently passed:
 
@@ -555,3 +733,327 @@ exercised for real, taking the suite to **11/11**. Only one of the two adds a
 new assertion — the `vllm_ascend_C` import — because the `vllm` CLI check
 already counts on a build host, as "CLI on PATH", and merely gets stricter where
 a device exists.
+
+---
+
+## 8. Migrating the CANN line — what changed, and what is left
+
+The 950PR deployment failed because the image carried CANN 9.1.0 while the host
+runs 9.2.0. That is a real class of failure, not a version-string cosmetic:
+`torch_npu`, pyACL's C extension and the compiled ACLNN ops all bind to the
+toolkit's own `lib64`, so a minor skew surfaces as `undefined symbol` several
+imports deep, or as a NULL return from the first `aclnn*` call.
+
+The fix is not "edit `9.1.0` to `9.2.0` in four files". It is to make the CANN
+release a **parameter with no literal left behind**, and to assert the things
+that were previously assumed. That is what this section records.
+
+### 8.1 The release is now one variable
+
+`CANN_VERSION` (default `9.2.0`) drives every path that mentions it:
+
+| Where | Before | Now |
+|---|---|---|
+| `provision.sh` | `CANN_VERSION=9.1.0`, plus hardcoded `TOOLKIT_BYTES` / `NNAL_BYTES` | version-derived URLs; sizes from a per-release table, or a `HEAD` for a release with no entry |
+| `provision.sh` `VENDOR_TAG` | literal `9.1.0-950-ubuntu22.04-py3.10` | `${CANN_VERSION}-950-ubuntu22.04-py3.10` |
+| `deps.manifest` | `9.1.0` in four rows | `@CANN_VERSION@`, expanded by `build.sh` |
+| `build.sh` | `CANN_VERSION=9.1.0` | `9.2.0`, and the manifest is expanded before parsing |
+| `Dockerfile.x86_64` | `ARG CANN_VERSION=9.1.0` | `9.2.0`, and it is also an `ENV` so a running container can be asked |
+
+Building the previous line therefore needs no edits at all:
+
+```bash
+CANN_VERSION=9.1.0 ./targets/target-950pr/provision.sh
+CANN_VERSION=9.1.0 ./targets/target-950pr/build.sh
+```
+
+Three guards were added so a half-migrated payload cannot get through quietly,
+because that produces an image that looks healthy and fails on hardware:
+
+1. **`provision.sh verify` and `build.sh`** both refuse a payload containing
+   `Ascend-cann-*.run` from a release other than `$CANN_VERSION`.
+2. **`provision.sh cann`** checks the first bytes of each `.run` are `#!` — a
+   403 XML body saved under the artefact's name has the right name and passes a
+   naive existence check.
+3. **The Dockerfile** reads `version=` out of `ascend_toolkit_install.info`
+   after installing, and fails the build if it disagrees with `CANN_VERSION`.
+
+`deps.manifest` also gained `pin|<version>|<file>|<bytes>|<sha256>` rows, which
+`build.sh` now actually verifies — the `sha256` column was documentation before,
+checked by nothing. A release with no pin row is size-checked with a warning
+naming the row to add; `provision.sh cann` prints the hashes to paste in.
+
+### 8.2 Where a pre-release CANN comes from
+
+Since 9.2.0 is not downloadable (§1a), the payload accepts a vendor drop:
+
+```bash
+mkdir -p vendor/cann-9.2.0
+cp Ascend-cann-toolkit_9.2.0_linux-x86_64.run vendor/cann-9.2.0/
+cp Ascend-cann-nnal_9.2.0_linux-x86_64.run    vendor/cann-9.2.0/
+./targets/target-950pr/provision.sh cann
+```
+
+`cann_extra` — the twenty-six runtime libraries the standalone toolkit omits,
+`libopapi.so` / `libopapi_math.so` / `libhccl.so` among them — has the same
+problem one level down: it is lifted from Huawei's vendor container, and there
+is no 9.2.0 container either. Two offline routes:
+
+```bash
+cp libopapi_math.so libhccl.so vendor/cann-9.2.0/cann_extra/lib64/
+
+docker save VENDOR_IMAGE -o cann-9.2.0-vendor.tar
+CANN_VENDOR_TAR=$PWD/cann-9.2.0-vendor.tar ./targets/target-950pr/provision.sh cann_extra
+```
+
+**`VENDOR_TAG` is deliberately not allowed to silently fall back to 9.1.0.**
+These libraries are copied into the toolkit's own `lib64` and resolved by the
+same loader, so mixing releases *is* the undefined-symbol failure this migration
+exists to remove. `provision.sh` stops with the commands above instead.
+
+### 8.3 The hardcoded-path audit
+
+Run against `vllm-ascend @ releases/v0.27.1rc` (`e61a5d7`), the ref this target
+now pins. **Nothing requires `/usr/local/Ascend/cann-9.2.0`.** The complete set
+of version-stamped CANN paths in that tree is one line, and it is a glob:
+
+```
+tests/e2e/nightly/multi_node/scripts/run.sh:44
+    CANN_DIR=$(ls -d /usr/local/Ascend/cann-* 2>/dev/null | head -1 || true)
+```
+
+with its own comment saying the directory "varies between release (cann-9.1.0)
+and daily (e.g. cann-2026.08.03) images, so discover it dynamically instead of
+hardcoding a version-specific path". It is nightly multi-node test tooling, it
+only sources the *optional* `ascendnpu-ir/bin/set_env.sh`, and it degrades to a
+warning when absent.
+
+Everything else resolves the toolkit through one of:
+
+| Path | Consumers |
+|---|---|
+| `$ASCEND_HOME_PATH` / `$ASCEND_TOOLKIT_HOME` | `csrc/build.sh:1338`, `csrc/cmake/config.cmake:26`, `csrc/cmake/dependencies.cmake:13`, `setup.py:263` |
+| `/usr/local/Ascend/ascend-toolkit/latest` | `collect_env.py:300`, upstream's own Dockerfiles, `csrc/build.sh:73` |
+| `/usr/local/Ascend/latest` (no `ascend-toolkit` segment) | `csrc/cmake/config.cmake:30`, `csrc/cmake/dependencies.cmake:19`, `csrc/build.sh:74` — **fallbacks only**, each guarded by an `$ASCEND_HOME_PATH` test that this image satisfies |
+
+The Dockerfile creates both `cann-${CANN_VERSION}` and `latest` as symlinks to
+`ascend-toolkit/latest` anyway (stage 3c). Not because anything demands them —
+the audit says otherwise — but because they cost one inode each, they satisfy
+that glob so the optional `set_env.sh` is found rather than skipped, they make
+the tree match the vendor images operators have runbooks for, and they close the
+`/usr/local/Ascend/latest` fallback in case a future refactor upstream reaches
+it. `verify_runtime.sh` step 3 asserts all of them land on the same tree.
+
+### 8.4 pyACL
+
+`import acl` is CANN's own Python binding, shipped with the toolkit and built
+against that release's `libascendcl.so`. **It must never become a pip install** —
+anything on PyPI by that name is an unrelated project, and installing one
+shadows the real module with something that cannot talk to an NPU.
+
+It is on the inference path, not optional:
+
+```
+vllm_ascend/device_allocator/camem.py:27
+    from acl.rt import memcpy
+```
+
+at module scope, for the CANN-mem sleep-mode allocator. The wiring is three
+layers, each covering a gap the previous one leaves:
+
+1. **`PYTHONPATH`** carries `${ASCEND_TOOLKIT_HOME}/python/site-packages` and
+   the arch-qualified `x86_64-linux/…` spelling. Which one physically holds the
+   module depends on the release's symlink layout, so both are listed.
+2. **A `.pth` file** in the interpreter's own `purelib`, written at build time by
+   `common/docker/pyacl_wire.py --install` after *discovering* the directory.
+   This is what makes `import acl` resolve **natively, with no pip install and
+   no environment cooperation**: `PYTHONPATH` is a single string that
+   `docker run -e PYTHONPATH=...` replaces outright, and any wrapper that scrubs
+   the environment (`env -i`, a supervisor, a spawn worker from a sanitised
+   parent) loses it. `site` reads the `.pth` at every interpreter start.
+3. **Assertions**, at build time and again at run time, that distinguish three
+   outcomes which look alike in a traceback:
+
+   | Outcome | Meaning | Build | `verify` on a build host | `verify` on a 950PR |
+   |---|---|---|---|---|
+   | module not found | toolkit installed without `--full` | **fail** | fail | fail |
+   | `undefined symbol` | pyACL and the CANN libraries beside it are different releases | **fail** | fail | fail |
+   | missing `libascend_hal.so` etc. | host driver not mounted — `/usr/local/Ascend/driver/lib64` is empty in the image by design | pass, noted | pass, noted | **fail** |
+
+`LD_LIBRARY_PATH` was audited rather than reordered. "Put the toolkit first" is
+the wrong instinct here: the three `/usr/local/Ascend/driver/lib64*` entries
+ahead of it are **empty in the image** and are where the host's driver is
+bind-mounted, and the driver half of the stack must come from the host kernel
+module's own userspace. Promoting the toolkit above them would shadow the real
+driver with the toolkit's stubs — healthy on a build host, broken on silicon.
+Since this image contains exactly one CANN tree (`cann-${CANN_VERSION}` and
+`latest` are symlinks *into* it, not copies), the toolkit's `lib64` sitting
+immediately after those three already has the highest priority any CANN library
+can have. What was added is upstream's `<arch>-linux/devlib` spelling alongside
+this repo's `devlib`, since which one exists varies by release.
+
+### 8.5 The vllm-ascend ref is pinned
+
+`provision.sh` staged `main` while the Dockerfile stamped
+`SETUPTOOLS_SCM_PRETEND_VERSION=0.26.0` on whatever arrived — so the wheel
+claimed a version it was not built from, and two provisioning runs a day apart
+produced different images from an unchanged repository. Both now point at
+`releases/v0.27.1rc`, fetched **by commit** (`VLLM_ASCEND_COMMIT`,
+`e61a5d7204fe4a0fc329471df8e4c3c90e9bb2f1`), with the stamp moved to `0.27.1`.
+That branch is the one upstream cuts against vLLM v0.27.1 — already this
+target's `VLLM_REF` — and its `Dockerfile.a5` pins the same torch / torch_npu /
+triton-ascend set the wheelhouse stages. `src/vllm-ascend/.provenance` records
+repo, ref, commit and timestamp, so an image traces back to an exact tree with
+`.git` deleted.
+
+### 8.6 torch_npu is the pin the repo cannot derive
+
+Everything else in the wheelhouse is independent of the CANN release. `torch_npu`
+is not: it links the toolkit's `lib64` directly, so it is paired with a CANN
+version the way pyACL is, and getting it wrong produces `undefined symbol` at
+`import torch_npu`.
+
+There is no table to look it up in. torch_npu's own published compatibility
+matrix is on the **8.x** CANN numbering and stops at
+
+| CANN | PyTorch | torch_npu |
+|---|---|---|
+| 8.5.0 | 2.12.0 | 2.12.0rc1 |
+
+with **no CANN 9.x row at all** — the 950/A5 line is newer than that table. The
+only authority for a 9.x pairing is vllm-ascend's own pins, and at the ref this
+target follows those are `torch==2.10.0` / `torch-npu==2.10.0.post4`
+(`requirements.txt:16-17`, `pyproject.toml:21-22`), paired with CANN 9.1.0 by
+`Dockerfile.a5`.
+
+So for a 9.2.0 build the pairing is **unattested, not wrong**. PyPI also carries
+`2.10.0.post6`, `2.11.0` and `2.12.0`, and choosing one of those because it is
+newer is exactly the guess that breaks the import. `provision.sh verify`
+therefore *warns* rather than failing — the payload is usable, the pairing is
+not confirmed — and names `TORCH_NPU_CANN` (default `9.1.0`) as the variable to
+move once it is. Take the real answer from the vendor drop's release notes, or
+from a vllm-ascend ref whose `Dockerfile.a5` names 9.2.0; upstream's daily stage
+carries `ARG TORCH_NPU_VERSION` / `TORCH_NPU_DATE` precisely because a
+pre-release CANN needs a torch_npu built against it. Move torch, torchvision,
+torchaudio and triton-ascend with it — upstream treats the five as one set.
+
+### 8.7 What remains, and what blocks it
+
+Everything above is in the repository and the logic is exercised: the manifest
+templating and `pin` verification were replayed against fabricated payloads
+(correct / corrupted / truncated / mixed-release), the vendor-drop adoption and
+the `#!` shape check were run end to end, the unobtainable-release and
+unpublished-vendor-image error paths were triggered against the live bucket and
+registry, and the `.pth` mechanism was proven in a venv — `import acl` resolving
+in a fresh interpreter with `PYTHONPATH` unset.
+
+**The 9.2.0 build itself has not been run**, and one thing blocks it: there is
+no CANN 9.2.0 to build against (§1a). It needs a vendor drop into
+`vendor/cann-9.2.0/`. `deps/950pr-x86_64/` is also empty in this checkout, so
+provisioning is a further ~10 GB, but that is time rather than a blocker.
+
+What *was* run without it:
+
+* `docker buildx build --check` over the whole Dockerfile — **no warnings**.
+* `common/docker/pyacl_wire.py` against a real CANN 9.1.0 install, out of
+  `quay.io/ascend/cann:9.1.0-950-ubuntu22.04-py3.10`, to confirm the discovery
+  and classification logic against a genuine toolkit layout rather than an
+  assumed one.
+
+With the drop in place:
+
+```bash
+./targets/target-950pr/provision.sh
+./targets/target-950pr/build.sh --no-cache --save artifacts/vllm-ascend-950pr-x86_64-offline.tar.gz
+./targets/target-950pr/run_dev.sh verify
+```
+
+Expect roughly 95 minutes cold (§7), dominated by the 493 ACLNN kernel binaries
+that 9.2.0's `bisheng` will rebuild from scratch. The acceptance criteria —
+`import acl`, `import torch_npu` and `vllm_ascend_C` with no `undefined symbol`
+or path errors — are assertions 6, 7 and 10 of the suite, and on the 950PR
+itself the pyACL check tightens from "resolves" to "imports" (14/14).
+
+### 8.8 Two build flags corrected against a real CANN 9.1.0 toolkit
+
+The pyACL work needed a genuine CANN tree to test against, and Huawei's own
+`quay.io/ascend/cann:9.1.0-950-ubuntu22.04-py3.10` provided one. Having it on
+disk settled three things this repo had been carrying as assumptions — two of
+which were wrong.
+
+**1. `ASCEND_AICORE_ARCH` was `dav-v300`. That string does not exist.**
+
+`grep -rl dav-v300` over the entire toolkit returns nothing. Every Ascend950
+platform config — PR and DT alike — says:
+
+```ini
+# x86_64-linux/data/platform_config/Ascend950PR_957d.ini  (and 950DT_9582.ini)
+Short_SoC_version=Ascend950
+CCEC_AIC_version=dav-c310-cube
+CCEC_AIV_version=dav-c310-vec
+```
+
+The repo's convention is the base arch without the `-cube` / `-vec` suffix, and
+the other two targets confirm it: 310P3's ini says `CCEC_AIC_version=dav-m200`
+and this repo uses `dav-m200`; 910B's says `dav-c220-cube` and the docs say
+`dav-c220`. By the same rule Ascend950 is **`dav-c310`**, and that is now the
+value.
+
+The blast radius is small but real. `ASCEND_AICORE_ARCH` is **not read by
+vllm-ascend at all** — its tree contains no reference to the name — so the wheel
+build was never affected. It is this repo's own variable, consumed by
+`builders/builder-x86_64` and `build_vllm_ascend_wheel.sh` for direct
+`ccec`/`bisheng` invocations, and exported into the image so a dev shell has it.
+So the correction changes nothing about the image that ships and everything
+about whether a hand-run kernel compile targets the actual core.
+
+**2. `SOC_VERSION=ascend950dt_9582` is valid, but it is a 950-DT part.**
+
+It is genuinely buildable — `host_config.cmake`'s `ascend950_list` contains it
+and `platform_config/Ascend950DT_9582.ini` exists — and it is what upstream's
+`Dockerfile.a5` ships. But CANN treats 950PR and 950DT as **distinct SoC
+families** with separate name spaces, and `ascend950_list` carries both:
+
+| Family | Values in CANN 9.1.0 |
+|---|---|
+| **950PR** | `ascend950pr_`{`9579`, `957b`, `957c`, `957d`, `9589`, `958a`, `958b`, `9599`, `950z`} |
+| 950DT | `ascend950dt_`{`9571`–`9578`, `9581`–`9588`, `9591`, `9592`, `9595`, `9596`, `95a1`, `95a2`, `950x`, `950y`} |
+
+They share `Short_SoC_version=Ascend950` and the `dav-c310` core, so a DT build
+is not obviously wrong on PR silicon — but the 493 ACLNN kernel binaries this
+image compiles are keyed on the exact `SOC_VERSION`, and nothing checks at load
+time that it matches the part underneath. **This target is named 950PR and
+defaults to a DT value**, so `build.sh` now warns when `SOC_VERSION` is a
+`ascend950dt_*` one and points at the derivation:
+
+```bash
+npu-smi info -t board -i 0     # then (Chip Name + "_" + NPU Name), lowercased
+```
+
+That is not changed to a PR default here, because guessing *which* of the nine
+PR parts is as wrong as guessing DT. Derive it from the board.
+
+**3. `cann-<version>` is the canonical layout, not an alias.** Confirmed on both
+the 950 image and a 310P one:
+
+```
+/usr/local/Ascend/cann-9.1.0                    the actual tree
+/usr/local/Ascend/cann                       -> cann-9.1.0
+/usr/local/Ascend/ascend-toolkit/latest      -> /usr/local/Ascend/cann
+ASCEND_TOOLKIT_HOME=/usr/local/Ascend/cann-9.1.0     <- the vendor's own value
+ASCEND_HOME_PATH=/usr/local/Ascend/cann-9.1.0
+```
+
+This image installs from the `.run`, which lays down `ascend-toolkit/<ver>` plus
+`latest` and none of the `cann` names — so stage 3c adds them, linking in the
+opposite direction to the same effect. §8.3's audit said nothing *requires*
+them; this says the vendor images *have* them, which is the better reason.
+
+**And one assumption that held.** pyACL is at
+`<root>/python/site-packages/acl.so` (with an `acl/` package beside it), and
+`import acl; from acl.rt import memcpy` **succeeds with no NPU and no driver
+mounted** — `libascendcl.so` resolves its driver-side dependencies lazily. So
+the acceptance criterion is enforceable at build time, not only on the target.
+The build-time check still classifies a driver-shaped failure as non-fatal,
+since that is the one failure a build host cannot judge and a future release
+could start binding eagerly; `undefined symbol` is fatal everywhere.

@@ -16,6 +16,17 @@ deps/
 *.whl
 *.tar
 
+# --- vendor drops ----------------------------------------------------------
+# vendor/cann-<version>/ is where a CANN release that the public OBS bucket does
+# not carry is handed over by hand: the toolkit and NNAL .run installers, and
+# optionally cann_extra/lib64/*.so lifted from a vendor container.
+# targets/target-950pr/provision.sh adopts whatever is there instead of
+# downloading. Multi-GB, and in the pre-release case also NOT REDISTRIBUTABLE -
+# these arrive under a vendor agreement, so keeping them out of git is a
+# licensing matter as much as a size one. `*.run` and `*.so` above already cover
+# most of it; the directory is ignored outright so nothing slips through.
+vendor/
+
 # --- final deployable archives ---------------------------------------------
 # artifacts/ holds exported images (docker save | pigz) and wheelhouse bundles
 # on the Windows workspace filesystem. Multi-GB and regenerated on demand, so

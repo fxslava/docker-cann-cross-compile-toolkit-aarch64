@@ -15,8 +15,8 @@
 #  EVERY STEP BELOW IS OFFLINE. The build takes no network at all:
 #    apt     -> deps/950pr-x86_64/apt_debs (local file: repository)
 #    pip     -> deps/950pr-x86_64/python_wheels (--no-index --find-links)
-#    CANN    -> deps/950pr-x86_64/Ascend-cann-toolkit_9.1.0_linux-x86_64.run
-#               deps/950pr-x86_64/Ascend-cann-nnal_9.1.0_linux-x86_64.run
+#    CANN    -> deps/950pr-x86_64/cann_debs/*.deb (toolkit, 950 ops, NNAL;
+#               staged from the DevCloud apt repository, installed here offline)
 #    sources -> deps/950pr-x86_64/src/vllm-ascend (bind mount)
 #  See docs/target-950pr-x86_64.md for how to stage all of that.
 #
@@ -31,11 +31,42 @@
 #        -f targets/target-950pr/Dockerfile.x86_64 \
 #        -t vllm-ascend-950pr:x86_64-offline .
 #
-#  RELEASE MATRIX - read out of vllm-project/vllm-ascend@main, not chosen here.
-#  Dockerfile.a5 is upstream's own 950/A5 reference image and pins:
-#    CANN 9.1.0 | vLLM v0.27.1 | torch 2.10.0 | torch_npu 2.10.0.post4
+#  RELEASE MATRIX - read out of vllm-project/vllm-ascend, not chosen here.
+#  Dockerfile.a5 is upstream's own 950/A5 reference image and, on both main and
+#  releases/v0.27.1rc, pins:
+#    vLLM v0.27.1 | torch 2.10.0 | torch_npu 2.10.0.post4
 #    torchvision 0.25.0 | triton-ascend 3.2.2
 #  Do not bump one of these without the others.
+#
+#  CANN IS THE ONE AXIS THIS IMAGE MOVES ON ITS OWN, and CANN_VERSION now
+#  drives every path that mentions it. The default is 9.2.0 because that is
+#  what the 950PR host this image is deployed to runs, and a CANN minor is not
+#  a cosmetic difference: torch_npu, pyACL's C extension and the ACLNN custom
+#  ops all bind to the toolkit's own lib64, so an image built one minor behind
+#  its host fails at `import torch_npu` or at the first aclnn* call with an
+#  undefined symbol.
+#
+#  Upstream's Dockerfile.a5 still says CANN_VERSION="9.1.0" - it builds FROM a
+#  quay.io/ascend/cann image, so it can only name a CANN line Huawei has
+#  published a container for. This image installs CANN itself and is therefore
+#  not bound to that constraint.
+#
+#  CANN NOW COMES FROM HUAWEI'S OFFICIAL DevCloud APT REPOSITORY.
+#  targets/target-950pr/provision.sh installs Huawei's cann-keyring package into
+#  a staging container, which registers the signing key and the sources.list
+#  entry, and then downloads three packages pinned to an exact Debian version:
+#
+#    ascend-cann-toolkit=9.2.0-beta.2   compiler, headers, pyACL, dev tree
+#    ascend-cann-950-ops=9.2.0-beta.2   the Ascend950 operator payload
+#    ascend-cann-nnal=9.2.0-beta.2      ATB
+#
+#  apt verifies the repository signature, so the payload is authenticated at
+#  staging time rather than merely fetched over TLS. The .debs land in
+#  deps/950pr-x86_64/cann_debs/ and are installed HERE, offline, which is what
+#  keeps this build runnable under --network=none.
+#
+#  Build against the previous line with no edits:
+#    CANN_VERSION=9.1.0 CANN_APT_VERSION=9.1.0 ./targets/target-950pr/build.sh
 #
 #  THE BASE IS UBUNTU 22.04, WHICH IS WHAT UPSTREAM ACTUALLY SHIPS ON.
 #  Dockerfile.a5 builds on quay.io/ascend/cann:9.1.0-950-ubuntu22.04-py3.12,
@@ -54,12 +85,20 @@
 #  matrix is satisfiable at 3.10 with nothing dropped.
 # ============================================================================
 ARG BASE_IMAGE=ubuntu:22.04
-ARG CANN_VERSION=9.1.0
+ARG CANN_VERSION=9.2.0
+# THE EXACT DEBIAN VERSION, WHICH IS NOT THE SAME STRING AS CANN_VERSION.
+# 9.2.0-beta.2 is a package version of the 9.2.0 line; CANN itself calls the
+# install "9.2.0" in ascend_toolkit_install.info and lays down cann-9.2.0 /
+# ascend-toolkit/9.2.0 on disk. Keeping the two apart is what lets the apt pin
+# be exact while the filesystem paths stay the ones every CANN consumer looks
+# for - vllm-ascend's `ls -d /usr/local/Ascend/cann-*` glob included.
+ARG CANN_APT_VERSION=9.2.0-beta.2
 
 FROM --platform=linux/amd64 ${BASE_IMAGE}
 
 ARG DEBIAN_FRONTEND=noninteractive
 ARG CANN_VERSION
+ARG CANN_APT_VERSION
 ARG ASCEND_BASE=/usr/local/Ascend
 
 # SOC_VERSION IS DELIBERATELY LOWERCASE, and this exact string is upstream's.
@@ -70,26 +109,63 @@ ARG ASCEND_BASE=/usr/local/Ascend
 # generic path, or fails the setup.py assert outright. This is the same trap
 # documented for the 310P in README.aarch64.md §"Why SOC_VERSION is lowercase".
 #
-# ascend950dt_9582 is the value upstream's Dockerfile.a5 ships. On real silicon
-# derive yours instead of guessing - setup.py builds it as
-# (Chip Name + "_" + NPU Name).lower() from:
+# ascend950dt_9582 is the value upstream's Dockerfile.a5 ships, and it is a real
+# SoC: CANN 9.1.0's host_config.cmake lists it in ascend950_list, and
+# platform_config/Ascend950DT_9582.ini exists.
+#
+# BUT IT IS A 950-DT PART, AND THIS TARGET IS NAMED 950PR. CANN treats the two
+# as distinct SoC families with separate name spaces and separate platform
+# configs, and ascend950_list carries both:
+#
+#   950PR  ascend950pr_{9579,957b,957c,957d,9589,958a,958b,9599,950z}
+#   950DT  ascend950dt_{9571..9578,9581..9588,9591,9592,9595,9596,95a1,95a2,950x,950y}
+#
+# They share Short_SoC_version=Ascend950 and the dav-c310 core, so a DT build is
+# not obviously wrong on PR silicon - but the ACLNN kernel binaries this image
+# compiles are keyed on the exact SOC_VERSION, and nothing checks at load time
+# that it matches the part underneath.
+#
+# DERIVE IT FROM THE ACTUAL BOARD rather than inheriting this default.
+# setup.py builds it as (Chip Name + "_" + NPU Name).lower() from:
 #     npu-smi info -t board -i 0
+# On a 950PR that yields an ascend950pr_* value, not this one.
 ARG SOC_VERSION=ascend950dt_9582
 
-# DaVinci v3 AI Core. UNVERIFIED against CANN 9.1.0's own tables: this repo has
-# not had the 9.1.0 payload on disk, and vllm-ascend only reveals that ascend950
-# maps to kernel "arch35" (csrc/CMakeLists.txt ARCH_DIRECTORY_LIST). Confirm
-# before trusting a kernel build, with the probe from docs/soc-build-matrix.md:
-#     grep -nE '^set\((ascend|kirin)[a-z0-9_]*_list' \
-#       <toolkit>/ascendc_kernel_cmake/legacy_modules/host_config.cmake
-# targets/target-950pr/build.sh runs that check when the payload is staged.
-ARG ASCEND_AICORE_ARCH=dav-v300
+# DaVinci v3 AI Core. THIS WAS dav-v300 AND dav-v300 IS NOT A REAL ARCH STRING.
+# It was carried as an explicitly unverified guess because this repo had never
+# had a CANN 9.x payload on disk. It has now been checked against one - Huawei's
+# quay.io/ascend/cann:9.1.0-950-ubuntu22.04-py3.10 - and:
+#
+#   * `grep -rl dav-v300` over the whole toolkit returns NOTHING;
+#   * every Ascend950 platform config, PR and DT alike, says
+#         Short_SoC_version=Ascend950
+#         CCEC_AIC_version=dav-c310-cube
+#         CCEC_AIV_version=dav-c310-vec
+#     (x86_64-linux/data/platform_config/Ascend950{PR,DT}_*.ini).
+#
+# The repo's convention is the base arch without the -cube/-vec suffix, which
+# the other two targets confirm: 310P3's ini says CCEC_AIC_version=dav-m200 and
+# this repo uses dav-m200; 910B's says dav-c220-cube and the docs say dav-c220.
+# By the same rule Ascend950 is dav-c310.
+#
+# This value is NOT read by vllm-ascend (its tree contains no reference to
+# ASCEND_AICORE_ARCH at all) - it is this repo's own, used by
+# builders/builder-x86_64 and build_vllm_ascend_wheel.sh for direct ccec/bisheng
+# invocations, and exported here so a dev shell in this image has the right one.
+# So correcting it changes nothing about the wheel build and everything about
+# whether a hand-run kernel compile targets the actual core.
+ARG ASCEND_AICORE_ARCH=dav-c310
 
 ARG COMPILE_CUSTOM_KERNELS=1
 
 # setuptools-scm cannot see a tag in an exported checkout, so the wheel version
-# is pinned explicitly. Match the provisioned vllm-ascend ref.
-ARG VLLM_ASCEND_VERSION=0.26.0
+# is pinned explicitly. IT MUST MATCH THE PROVISIONED REF, and it did not:
+# provision.sh staged vllm-ascend@main while this said 0.26.0, so the wheel
+# claimed a version it was not built from and `pip show vllm-ascend` pointed at
+# the wrong upstream tree when debugging. provision.sh now pins
+# releases/v0.27.1rc - the branch upstream cuts against vLLM v0.27.1, which is
+# already this target's VLLM_REF - so the stamp follows it.
+ARG VLLM_ASCEND_VERSION=0.27.1
 
 # ---------------------------------------------------------------------------
 # 1. Base packages, installed from the local amd64 apt archive
@@ -145,48 +221,144 @@ RUN --mount=type=bind,source=deps/950pr-x86_64/python_wheels,target=/opt/wheels 
     && python3 -m pip --version
 
 # ---------------------------------------------------------------------------
-# 3. CANN 9.1.0 toolkit + NNAL, installed natively
+# 3. CANN ${CANN_APT_VERSION}: toolkit + Ascend950 ops + NNAL, installed offline
 # ---------------------------------------------------------------------------
-# --full installs the development and op-package payload that vllm-ascend's
-# Ascend C build needs; --install-for-all keeps the tree readable by the
-# unprivileged HwHiAiUser the driver runs its helpers as.
+# The three .debs under deps/950pr-x86_64/cann_debs/ came from Huawei's official
+# DevCloud apt repository, pinned to ${CANN_APT_VERSION} and GPG-verified by apt
+# when provision.sh staged them. They are installed here rather than fetched
+# here, which is what keeps this build runnable with --network=none.
 #
-# NNAL carries ATB (Ascend Transformer Boost). It is NOT optional here:
-# upstream's Dockerfile.a5 sources nnal/atb/set_env.sh before building
-# vllm-ascend, and the attention paths link against it.
-RUN --mount=type=bind,source=deps/950pr-x86_64/Ascend-cann-toolkit_${CANN_VERSION}_linux-x86_64.run,target=/tmp/cann-toolkit.run \
+# WHY THIS IS NOT `dpkg -i`, WHICH IS THE OBVIOUS THING TO WRITE.
+# ---------------------------------------------------------------------------
+# These packages are thin wrappers: each one's data.tar holds exactly ONE file,
+# the vendor's own Ascend-cann-*_${CANN_APT_VERSION}_linux-x86_64.run, and its
+# postinst runs that installer and deletes it. Measured on 9.2.0-beta.2, that
+# postinst is:
+#
+#     ${RUN} --install --install-path="/usr/local/Ascend" --force --nox11 \
+#            --install-for-all
+#
+# and it is unusable in a container build for two independent reasons:
+#
+#   1. NO --quiet, SO IT STOPS ON THE EULA. The installer prints the licence and
+#      waits for a human. In a Docker RUN there is no human, so it exits 1 and
+#      dpkg reports "post-installation script subprocess returned error exit
+#      status 1" with NOTHING installed - /usr/local/Ascend is left empty. This
+#      was measured, not inferred. The vendor's own flag for this is --quiet,
+#      documented in the installer's --help as the scripting option and as the
+#      means of accepting the EULA.
+#
+#   2. --install IS "run" MODE, NOT "full". The installer's --help spells the
+#      scenes out: `--install | --devel | --full   Install run | devel | full
+#      mode`. Run mode omits the development payload that vllm-ascend's Ascend C
+#      build needs and the pyACL module that vllm_ascend/device_allocator/
+#      camem.py imports at module scope. An image built from run mode would fail
+#      at `import acl`, not at build time.
+#
+# So the .run is taken back out of the .deb and driven directly, with the same
+# flags this target has always used. NOTHING ABOUT THE PAYLOAD CHANGES: the
+# bytes are the vendor's, authenticated by apt at staging time and pinned by
+# sha256 in deps.manifest. What changes is only that the scene is chosen here
+# instead of by a postinst that cannot run unattended.
+#
+# --fsys-tarfile streams the data.tar without unpacking the whole package to
+# disk first, and the extraction, the install and the cleanup all happen in ONE
+# RUN so the multi-gigabyte intermediate never becomes an image layer.
+#
+# THE SCENE IS PER PACKAGE, AND THE THREE DO NOT SHARE AN OPTION GRAMMAR.
+# Read out of each installer's own --help on ${CANN_APT_VERSION}:
+#   toolkit   --install | --devel | --full  -> --full, the only scene carrying
+#             the development payload and pyACL.
+#   950-ops   --install | --devel           -> --install. There is NO --full
+#             here; passing one makes the installer print its usage and do
+#             nothing, which exits 0 and would look exactly like success.
+#   nnal      --install                     -> --install. Its scenes are
+#             install/upgrade/uninstall only, and a run with no scene at all is
+#             rejected outright with "[NNAL] [ERROR] parameter error ! Scene is
+#             neither install nor devel, full, uninstall, upgrade."
+#
+# ORDER MATTERS. The toolkit lays down the cann-<version> tree and `latest`;
+# the ops package installs into that tree and its own uninstall path expects
+# it; NNAL wants the toolkit's environment. Toolkit, then ops, then NNAL.
+RUN --mount=type=bind,source=deps/950pr-x86_64/cann_debs,target=/cann_debs \
     set -eux; \
-    bash /tmp/cann-toolkit.run --full --quiet \
-        --install-path=${ASCEND_BASE} --install-for-all; \
+    install_cann_deb() { \
+        pkg="$1"; run="$2"; scene="$3"; \
+        deb="/cann_debs/${pkg}_${CANN_APT_VERSION}_amd64.deb"; \
+        test -f "$deb"; \
+        rm -rf /tmp/cannx; mkdir -p /tmp/cannx; \
+        dpkg-deb --fsys-tarfile "$deb" \
+            | tar -xf - -C /tmp/cannx "./usr/local/Ascend/${run}"; \
+        chmod +x "/tmp/cannx/usr/local/Ascend/${run}"; \
+        "/tmp/cannx/usr/local/Ascend/${run}" --quiet ${scene} \
+            --install-path=${ASCEND_BASE} --install-for-all --force; \
+        rm -rf /tmp/cannx; \
+    }; \
+    install_cann_deb ascend-cann-toolkit \
+        "Ascend-cann-toolkit_${CANN_APT_VERSION}_linux-x86_64.run" --full; \
     test -e ${ASCEND_BASE}/ascend-toolkit/latest/lib64/libascendcl.so; \
     rm -rf /root/toolkit_tmp /root/var/log/ascend_seclog/* /root/log 2>/dev/null || true; \
-    echo "toolkit: $(find ${ASCEND_BASE} -type f | wc -l) files"
-
-# --install IS REQUIRED AND IS NOT THE SAME FLAG THE TOOLKIT TAKES. The two
-# installers have different option grammars: the toolkit accepts --full as its
-# "scene", while NNAL's scenes are --install / --upgrade / --uninstall and it
-# rejects a run with no scene at all -
-#     [NNAL] [ERROR] parameter error ! Scene is neither install nor devel,
-#     full, uninstall, upgrade.
-# produced by an otherwise-correct-looking `--quiet --install-path=...`.
-# NNAL also offers --whitelist=atb|SIP|all to narrow the subpackage
-# set; the default set is taken here and the assertion below is what proves ATB
-# actually landed, rather than assuming it from the exit status.
-RUN --mount=type=bind,source=deps/950pr-x86_64/Ascend-cann-nnal_${CANN_VERSION}_linux-x86_64.run,target=/tmp/cann-nnal.run \
-    set -eux; \
+    : "find -L, NOT find: on the 9.2.0 layout ascend-toolkit/ holds only" \
+      "symlinks (latest -> ../cann -> ../cann-<apt version>), and a plain find" \
+      "does not follow them - so it would report NO version, silently demoting" \
+      "the assertion below to a warning."; \
+    installed=$(find -L ${ASCEND_BASE}/ascend-toolkit -maxdepth 3 \
+                     -name ascend_toolkit_install.info 2>/dev/null \
+                | head -1 | xargs -r sed -n 's/^version=//p'); \
+    echo "toolkit: $(find ${ASCEND_BASE} -type f | wc -l) files, version=${installed:-unknown}"; \
+    case "${installed}" in \
+        ${CANN_VERSION}*) : ;; \
+        "")  echo "WARNING: could not read a version out of ascend_toolkit_install.info" >&2 ;; \
+        *)   echo "ERROR: the staged package installed CANN ${installed}, but this image is" >&2; \
+             echo "       being built as CANN ${CANN_VERSION}. The version is not cosmetic -" >&2; \
+             echo "       it is stamped into paths and into every ABI assumption below." >&2; \
+             echo "       Re-stage the payload for ${CANN_VERSION}, or build with" >&2; \
+             echo "       CANN_VERSION=${installed}." >&2; \
+             exit 1 ;; \
+    esac; \
+    \
+    install_cann_deb ascend-cann-950-ops \
+        "Ascend-cann-950-ops_${CANN_APT_VERSION}_linux-x86_64.run" --install; \
+    echo "950-ops: $(ls ${ASCEND_BASE}/ascend-toolkit/latest/lib64/*.so 2>/dev/null | wc -l) libraries in lib64"; \
+    \
     . ${ASCEND_BASE}/ascend-toolkit/set_env.sh; \
-    bash /tmp/cann-nnal.run --quiet --install \
-        --install-path=${ASCEND_BASE} --install-for-all; \
+    install_cann_deb ascend-cann-nnal \
+        "Ascend-cann-nnal_${CANN_APT_VERSION}_linux-x86_64.run" --install; \
     test -e ${ASCEND_BASE}/nnal/atb/set_env.sh; \
     echo "nnal/atb installed"
+
+# THE PROVENANCE OF WHAT WAS JUST INSTALLED, recorded in the image.
+# dpkg was bypassed above for the reasons given, so `dpkg -l | grep ascend`
+# would say nothing and there would otherwise be no way to ask a running
+# container which repository and which exact package version it came from.
+# verify_runtime.sh reads this back.
+RUN --mount=type=bind,source=deps/950pr-x86_64/cann_debs,target=/cann_debs \
+    set -eux; \
+    mkdir -p ${ASCEND_BASE}; \
+    { echo "# CANN provenance for this image - written by Dockerfile.x86_64 stage 3."; \
+      echo "# Packages came from Huawei's DevCloud apt repository, GPG-verified by"; \
+      echo "# apt when targets/target-950pr/provision.sh staged them, then installed"; \
+      echo "# offline from deps/950pr-x86_64/cann_debs/."; \
+      echo "repository=https://ascend.devcloud.huaweicloud.com/cann/debian"; \
+      echo "suite=cann component=main"; \
+      echo "cann_version=${CANN_VERSION}"; \
+      echo "cann_apt_version=${CANN_APT_VERSION}"; \
+      for f in /cann_debs/*.deb; do \
+          echo "package=$(basename "$f") sha256=$(sha256sum "$f" | cut -d' ' -f1)"; \
+      done; \
+    } > ${ASCEND_BASE}/.cann-provenance; \
+    cat ${ASCEND_BASE}/.cann-provenance
 
 # ---------------------------------------------------------------------------
 # 3a. cann_extra - the SoC runtime libraries the standalone toolkit omits
 # ---------------------------------------------------------------------------
-# The publicly downloadable CANN 9.1.0 toolkit is NOT a complete CANN install.
-# Diffing its lib64 against the vendor image Huawei publishes for this SoC
-# (quay.io/ascend/cann:9.1.0-950-ubuntu22.04-py3.10) shows 176 shared objects
-# there against 150 here - twenty-six missing, and two of them are load-bearing:
+# The standalone CANN toolkit .run is NOT a complete CANN install. Measured on
+# 9.1.0: diffing its lib64 against the vendor image Huawei publishes for this
+# SoC (quay.io/ascend/cann:9.1.0-950-ubuntu22.04-py3.10) shows 176 shared
+# objects there against 150 here - twenty-six missing, two load-bearing. The
+# same gap is assumed for later releases; provision.sh derives the vendor tag
+# from CANN_VERSION so the libraries always come from the MATCHING release
+# rather than from whichever one happened to be hardcoded:
 #
 #   libopapi.so       vllm-ascend links it unconditionally (CMakeLists.txt puts
 #                     `opapi` in VLLM_ASCEND_C_COMMON_LIBS for every SoC), so
@@ -207,18 +379,48 @@ RUN --mount=type=bind,source=deps/950pr-x86_64/Ascend-cann-nnal_${CANN_VERSION}_
 # every name while the toolkit and NNAL return 206, so the vendor image is the
 # only published source. targets/target-950pr/provision.sh stages them from
 # that image's own layer blob; the 310P target obtains libhccl.so the same way
-# on CANN 8.5.0.
+# on CANN 8.5.0. Where no vendor image exists yet for CANN_VERSION, that same
+# script accepts them from vendor/cann-<version>/cann_extra/lib64/ or from a
+# `docker save`d image via CANN_VENDOR_TAR - it will NOT silently substitute a
+# different release, because these land in the toolkit's own lib64 and a mixed
+# pair is what produces undefined symbols at import time.
+# THE DIRECTORY IS NOW USUALLY EMPTY, AND THAT IS THE POINT.
+# ascend-cann-950-ops is the operator package whose absence created this
+# workaround, and it is installed in stage 3 above from the same apt repository
+# and the same release as the toolkit. So the libraries come from the release's
+# own package instead of from a container image of a DIFFERENT release, which
+# is the mixed-ABI hazard the long note above is about.
+#
+# cann_extra survives as an override for a release whose ops package turns out
+# to be missing something: anything staged here is copied over the top. The
+# assertion below is on the OUTCOME rather than on the source, so it holds
+# whether the libraries came from the ops package or from a hand-staged drop -
+# and an empty cann_extra with a complete ops package is a pass.
 RUN --mount=type=bind,source=deps/950pr-x86_64/cann_extra,target=/cann_extra \
     set -eux; \
     TK="${ASCEND_BASE}/ascend-toolkit/latest"; \
     n=0; \
     for so in /cann_extra/lib64/*.so; do \
+        [ -e "$so" ] || continue; \
         cp -a "$so" "${TK}/lib64/"; n=$((n+1)); \
     done; \
-    test -e "${TK}/lib64/libopapi.so"; \
-    test -e "${TK}/lib64/libopapi_math.so"; \
     ldconfig; \
-    echo "cann_extra: installed $n libraries into ${TK}/lib64"
+    echo "cann_extra: $n override librar$([ "$n" = 1 ] && echo y || echo ies) copied into ${TK}/lib64"; \
+    for lib in libopapi.so libopapi_math.so; do \
+        if [ ! -e "${TK}/lib64/$lib" ]; then \
+            echo "ERROR: ${TK}/lib64/$lib is absent after installing" >&2; \
+            echo "       ascend-cann-950-ops=${CANN_APT_VERSION}. vllm-ascend links -lopapi" >&2; \
+            echo "       for every SoC and the custom-ops package will not install without" >&2; \
+            echo "       libopapi_math.so, so this is fatal rather than cosmetic." >&2; \
+            echo "       Either the ops package for this release does not carry it - in" >&2; \
+            echo "       which case stage it into deps/950pr-x86_64/cann_extra/lib64/ - or" >&2; \
+            echo "       the ops install silently did nothing, which is what happens when" >&2; \
+            echo "       the installer is handed a scene it does not know (it prints its" >&2; \
+            echo "       usage and exits 0). Check the '950-ops:' line in stage 3." >&2; \
+            exit 1; \
+        fi; \
+    done; \
+    echo "operator runtime: $(ls ${TK}/lib64/*.so 2>/dev/null | wc -l) libraries in lib64"
 
 # ---------------------------------------------------------------------------
 # 3b. libhccl.so - the aggregate the toolkit deliberately does not ship
@@ -230,6 +432,110 @@ RUN --mount=type=bind,source=deps/950pr-x86_64/cann_extra,target=/cann_extra \
 RUN --mount=type=bind,source=common/patches/hccl_devlib_fallback.sh,target=/tmp/hccl_devlib_fallback.sh \
     ASCEND_TOOLKIT_HOME="${ASCEND_BASE}/ascend-toolkit/latest" \
         sh /tmp/hccl_devlib_fallback.sh
+
+# ---------------------------------------------------------------------------
+# 3c. /usr/local/Ascend/cann-${CANN_VERSION} - the layout Huawei's own images use
+# ---------------------------------------------------------------------------
+# WHAT THE AUDIT ACTUALLY FOUND, so nobody re-derives it from the assumption
+# that started this. Grepping vllm-ascend @ releases/v0.27.1rc for a
+# version-stamped CANN path turns up exactly ONE reference, and it is a glob:
+#
+#   tests/e2e/nightly/multi_node/scripts/run.sh:44
+#     CANN_DIR=$(ls -d /usr/local/Ascend/cann-* 2>/dev/null | head -1 || true)
+#
+# with its own comment saying the directory "varies between release (cann-9.1.0)
+# and daily (e.g. cann-2026.08.03) images, so discover it dynamically instead of
+# hardcoding a version-specific path". NOTHING in the build, the wheel or the
+# inference path requires /usr/local/Ascend/cann-9.2.0 specifically; every other
+# consumer resolves the toolkit through $ASCEND_HOME_PATH / $ASCEND_TOOLKIT_HOME
+# or through /usr/local/Ascend/ascend-toolkit/latest, both of which this image
+# already provides.
+#
+# The symlinks are created anyway, and the second reason turned out to be the
+# strong one. Inspecting a real CANN 9.1.0 install - Huawei's own
+# ascendhub/cann:9.1.0-310p-ubuntu22.04-py3.10 - shows that `cann-<version>` is
+# THE canonical root in the 9.x images, not an alias:
+#
+#   /usr/local/Ascend/cann-9.1.0        the actual tree
+#   /usr/local/Ascend/cann           -> /usr/local/Ascend/cann-9.1.0
+#   /usr/local/Ascend/ascend-toolkit/latest
+#   ASCEND_TOOLKIT_HOME=/usr/local/Ascend/cann-9.1.0     <- vendor's own value
+#   ASCEND_HOME_PATH=/usr/local/Ascend/cann-9.1.0
+#   PYTHONPATH lists BOTH .../ascend-toolkit/latest/python/site-packages
+#              and     .../cann-9.1.0/python/site-packages
+#
+# This image installs from the .run, which lays down ascend-toolkit/<ver> and
+# `latest` but not the cann-<version> names, so without these links its tree is
+# the vendor layout with pieces missing. Three things want them:
+#   * that run.sh glob, so the optional ascendnpu-ir set_env.sh is found rather
+#     than skipped with a warning;
+#   * csrc/attention/k2q_csr/README.md:44 and
+#     csrc/attention/sparse_attention_score/tests/*.md, which tell a developer to
+#     `source /usr/local/Ascend/cann/set_env.sh` - the UNVERSIONED name;
+#   * any operator runbook written against a vendor image.
+# All three cost one inode each.
+#
+# The other hardcoded path in that tree is /usr/local/Ascend/latest (NO
+# ascend-toolkit segment): csrc/cmake/config.cmake:30, csrc/cmake/dependencies.cmake:19
+# and csrc/build.sh:74 all fall back to it. Every one of those is guarded by an
+# $ASCEND_HOME_PATH test first (csrc/build.sh:1338 is the canonical one), and
+# section 4 below exports ASCEND_HOME_PATH, so the fallback is unreachable in
+# this image. It is linked too, because an unreachable fallback that is
+# nevertheless correct costs nothing and a future refactor upstream may reach it.
+#
+# THE 9.2.0 INSTALLER ALREADY PRODUCES THE VENDOR LAYOUT, AND THE OLD VERSION
+# OF THIS STEP WOULD HAVE BUILT A SYMLINK LOOP OUT OF IT.
+#
+# Measured on 9.2.0-beta.2, the toolkit installer lays down:
+#
+#   /usr/local/Ascend/cann-9.2.0-beta.2          the real tree
+#   /usr/local/Ascend/cann                    -> cann-9.2.0-beta.2
+#   /usr/local/Ascend/ascend-toolkit/latest   -> /usr/local/Ascend/cann
+#   /usr/local/Ascend/ascend-toolkit/set_env.sh -> .../latest/set_env.sh
+#
+# Note what the real directory is called: cann-9.2.0-BETA.2, the full package
+# version, not the release line. That is why CANN_APT_VERSION exists as a
+# separate variable - but it is also why nothing should hardcode either name.
+#
+# This step used to do `ln -sfn ${ASCEND_BASE}/ascend-toolkit/latest` at each of
+# cann-<version>, cann and latest. On the 8.x/9.1 layout that was correct,
+# because ascend-toolkit/latest was the real tree. Here it is a symlink that
+# already points AT ${ASCEND_BASE}/cann, so relinking `cann` to it would produce
+#
+#   cann -> ascend-toolkit/latest -> cann -> ...
+#
+# an ELOOP that every path through the image would then fail on. So the target
+# is resolved to a real directory FIRST, with readlink -f, and every link is
+# made to point at that. A name that already resolves there is left exactly as
+# the installer made it.
+#
+# What the links are for is unchanged and is documented above: the run.sh glob,
+# the `source /usr/local/Ascend/cann/set_env.sh` in upstream's own operator
+# READMEs, and any runbook written against a vendor image. cann-${CANN_VERSION}
+# - the LINE, cann-9.2.0 - is added alongside the installer's own
+# cann-${CANN_APT_VERSION} so that a path written against the release rather
+# than against the beta also resolves.
+#
+# `ln -sfn` INTO AN EXISTING REAL DIRECTORY CREATES THE LINK INSIDE IT rather
+# than replacing it - -n only saves you from a symlink-to-directory - so a name
+# that is already a real directory is left alone rather than nested into.
+RUN set -eux; \
+    TK_REAL="$(readlink -f "${ASCEND_BASE}/ascend-toolkit/latest")"; \
+    test -d "$TK_REAL"; \
+    test -e "$TK_REAL/lib64/libascendcl.so"; \
+    echo "toolkit tree: $TK_REAL"; \
+    for name in "cann-${CANN_VERSION}" cann latest; do \
+        target="${ASCEND_BASE}/${name}"; \
+        if [ "$(readlink -f "$target" 2>/dev/null)" = "$TK_REAL" ]; then \
+            echo "${name}: already resolves to the toolkit tree, left alone"; \
+        elif [ -d "$target" ] && [ ! -L "$target" ]; then \
+            echo "${name}: already a real directory, left alone"; \
+        else \
+            ln -sfn "$TK_REAL" "$target"; \
+        fi; \
+        test -e "${target}/lib64/libascendcl.so"; \
+        ls -ld "$target"; \
+    done
 
 # ---------------------------------------------------------------------------
 # 4. Environment
@@ -249,18 +555,114 @@ ENV ASCEND_AICPU_PATH=${ASCEND_TOOLKIT_HOME}
 ENV TOOLCHAIN_HOME=${ASCEND_TOOLKIT_HOME}/toolkit
 ENV ATB_HOME_PATH=/usr/local/Ascend/nnal/atb/latest/atb/cxx_abi_1
 ENV PATH=${ASCEND_TOOLKIT_HOME}/bin:${ASCEND_TOOLKIT_HOME}/tools/ccec_compiler/bin:${ASCEND_TOOLKIT_HOME}/compiler/ccec_compiler/bin:${ASCEND_TOOLKIT_HOME}/tools/profiler/bin:${PATH}
-ENV LD_LIBRARY_PATH=/usr/local/Ascend/driver/lib64:/usr/local/Ascend/driver/lib64/common:/usr/local/Ascend/driver/lib64/driver:${ASCEND_TOOLKIT_HOME}/lib64:${ASCEND_TOOLKIT_HOME}/lib64/plugin/opskernel:${ASCEND_TOOLKIT_HOME}/lib64/plugin/nnengine:${ASCEND_TOOLKIT_HOME}/opp/built-in/op_impl/ai_core/tbe/op_tiling/lib/linux/x86_64:${ASCEND_TOOLKIT_HOME}/tools/aml/lib64:${ASCEND_TOOLKIT_HOME}/tools/aml/lib64/plugin:${ATB_HOME_PATH}/lib:${ASCEND_TOOLKIT_HOME}/devlib
-ENV PYTHONPATH=${ASCEND_TOOLKIT_HOME}/python/site-packages:${ASCEND_TOOLKIT_HOME}/opp/built-in/op_impl/ai_core/tbe
+# LD_LIBRARY_PATH ORDER IS DELIBERATE, AND "PUT THE TOOLKIT FIRST" IS WRONG.
+#
+# The toolkit's lib64 is what pyACL's C extension, torch_npu and the ACLNN
+# custom ops all bind to, and it must beat anything else that could offer the
+# same soname. In this image nothing else does: there is exactly one CANN tree
+# (section 3c's cann-${CANN_VERSION} and latest/ are symlinks INTO it, not
+# copies), so toolkit lib64 sitting immediately after the driver directories is
+# already the highest priority any CANN library can have here.
+#
+# /usr/local/Ascend/driver/lib64 stays ahead of it because those three
+# directories are EMPTY IN THE IMAGE - they are where the host's driver is
+# bind-mounted at run time, and the driver half of the stack (libascend_hal.so
+# and friends) must come from the host kernel module's own userspace, never
+# from the toolkit. Reordering these to "prioritise the toolkit" would shadow
+# the host driver with the toolkit's stubs and break on real silicon while
+# looking healthy on a build host.
+#
+# devlib is LAST for the same reason and is listed twice: this repo's
+# hccl_devlib_fallback.sh writes ${ASCEND_TOOLKIT_HOME}/devlib, while upstream's
+# own Dockerfiles append ${ASCEND_TOOLKIT_HOME}/<arch>-linux/devlib
+# (.github/workflows/dockerfiles/Dockerfile.buildwheel.a5:43). Whether latest/
+# exposes a top-level devlib symlink varies by release, so both spellings are on
+# the path; a non-existent entry costs one failed stat per dlopen and nothing else.
+ENV LD_LIBRARY_PATH=/usr/local/Ascend/driver/lib64:/usr/local/Ascend/driver/lib64/common:/usr/local/Ascend/driver/lib64/driver:${ASCEND_TOOLKIT_HOME}/lib64:${ASCEND_TOOLKIT_HOME}/lib64/plugin/opskernel:${ASCEND_TOOLKIT_HOME}/lib64/plugin/nnengine:${ASCEND_TOOLKIT_HOME}/opp/built-in/op_impl/ai_core/tbe/op_tiling/lib/linux/x86_64:${ASCEND_TOOLKIT_HOME}/tools/aml/lib64:${ASCEND_TOOLKIT_HOME}/tools/aml/lib64/plugin:${ATB_HOME_PATH}/lib:${ASCEND_TOOLKIT_HOME}/devlib:${ASCEND_TOOLKIT_HOME}/x86_64-linux/devlib
+
+# PYTHONPATH CARRIES pyACL. `import acl` is not a pip package and must never
+# become one: CANN ships the module with the toolkit, built against that exact
+# release's libascendcl.so, and any PyPI thing called "acl" is something else
+# entirely. vllm-ascend imports it unconditionally -
+# vllm_ascend/device_allocator/camem.py:27 does `from acl.rt import memcpy` at
+# module scope for the CANN-mem sleep-mode allocator - so a missing pyACL is an
+# ImportError on the inference path, not a degraded mode.
+#
+# Both site-packages spellings are listed for the same reason as devlib above:
+# latest/python/site-packages is the documented one (upstream references it
+# directly in tests/e2e/conftest.py:245), and the arch-qualified directory is
+# where the files physically live in an unpacked toolkit. Section 4a asserts
+# that one of them actually resolved rather than trusting the pair.
+#
+# THE THIRD SPELLING IS THE VERSION-STAMPED ONE, and it is there because that is
+# what the vendor's own images export: a real CANN 9.x image sets PYTHONPATH to
+# BOTH .../ascend-toolkit/latest/python/site-packages AND
+# .../cann-<version>/python/site-packages. Section 3c guarantees
+# ${ASCEND_BASE}/cann-${CANN_VERSION} resolves to the same tree, so this entry
+# costs nothing and matches a runbook written against a vendor image.
+ENV PYTHONPATH=${ASCEND_TOOLKIT_HOME}/python/site-packages:${ASCEND_TOOLKIT_HOME}/x86_64-linux/python/site-packages:${ASCEND_BASE}/cann-${CANN_VERSION}/python/site-packages:${ASCEND_TOOLKIT_HOME}/opp/built-in/op_impl/ai_core/tbe
 ENV CMAKE_PREFIX_PATH=${ASCEND_TOOLKIT_HOME}/lib64/cmake:${ASCEND_TOOLKIT_HOME}/toolkit/tools/tikicpulib/lib/cmake
 ENV SOC_VERSION=${SOC_VERSION}
 ENV ASCEND_AICORE_ARCH=${ASCEND_AICORE_ARCH}
 ENV COMPILE_CUSTOM_KERNELS=${COMPILE_CUSTOM_KERNELS}
+# Carried into the image, not just used at build time, so the running container
+# can be asked what it was built against. verify-runtime.sh asserts this against
+# the toolkit's own ascend_toolkit_install.info, which is the check that catches
+# an image whose CANN release has drifted from its host's driver - the failure
+# this target was migrated to fix.
+ENV CANN_VERSION=${CANN_VERSION}
+# The exact package version the payload was pinned to, so a running container
+# can be asked whether it is on a beta and which one. ${ASCEND_BASE}/.cann-provenance
+# carries the repository and the sha256s alongside it.
+ENV CANN_APT_VERSION=${CANN_APT_VERSION}
 # Ascend runtime knobs upstream sets in its own images.
 ENV TASK_QUEUE_ENABLE=1
 ENV OMP_NUM_THREADS=1
 
 # From here on RUN uses bash: CANN's set_env.sh is a bash script.
 SHELL ["/bin/bash", "-c"]
+
+# ---------------------------------------------------------------------------
+# 4a. pyACL, wired natively and asserted
+# ---------------------------------------------------------------------------
+# PYTHONPATH above is the primary wiring. This step exists because PYTHONPATH
+# alone is not durable enough for something on the inference path:
+#
+#   * it is a single ENV string, and anything that runs the image with
+#     `-e PYTHONPATH=...` REPLACES it rather than appending, silently
+#     unhooking pyACL;
+#   * multiprocessing spawn workers, the vLLM engine-core subprocess and any
+#     `env -i` wrapper inherit whatever the parent's environment happened to be.
+#
+# A .pth in the interpreter's own purelib is read by `site` at startup, so
+# `import acl` resolves for every process this image ever starts, with no
+# environment cooperation and no pip install. That is the "resolves natively"
+# requirement, satisfied by the mechanism CPython provides for it.
+#
+# THE DIRECTORY IS DISCOVERED, NOT ASSUMED. Which of latest/python/site-packages
+# and latest/<arch>-linux/python/site-packages physically holds the module
+# varies with how the toolkit lays out its symlinks, so both are probed and then
+# the whole tree is searched before giving up.
+#
+# THE IMPORT IS EXPECTED TO SUCCEED HERE, and it was measured doing so. Run
+# inside a real CANN 9.1.0 install with no NPU and no driver mounted:
+#
+#   pyacl: module directory /usr/local/Ascend/cann-9.1.0/python/site-packages
+#   pyacl: acl resolves to: .../python/site-packages/acl.so
+#   pyacl: import acl + acl.rt.memcpy OK
+#
+# So libascendcl.so's driver-side dependencies (libascend_hal.so and friends,
+# which live in the EMPTY /usr/local/Ascend/driver/lib64 this image leaves for
+# the host bind mount) are resolved lazily, not at import.
+#
+# The script still classifies a driver-shaped failure as non-fatal at build
+# time, because that is the one failure a build host genuinely cannot judge and
+# a future release could start binding eagerly. What is NEVER tolerated, here or
+# in verify-runtime.sh, is an `undefined symbol`: that means the pyACL extension
+# and the CANN libraries beside it come from different releases, which is
+# exactly the failure this migration exists to fix.
+RUN --mount=type=bind,source=common/docker/pyacl_wire.py,target=/tmp/pyacl_wire.py \
+    python3 /tmp/pyacl_wire.py --install
 
 # ---------------------------------------------------------------------------
 # 5. Torch stack, vLLM and the vllm-ascend dependency set - all offline
@@ -290,7 +692,7 @@ SHELL ["/bin/bash", "-c"]
 # reaches the wheelhouse instead of silently producing a fatter image.
 #
 # UPSTREAM'S requirements.txt IS FILTERED BEFORE IT IS INSTALLED, with the same
-# grep the 310P image uses. vllm-ascend@main requires memfabric_hybrid==1.2.0,
+# grep the 310P image uses. vllm-ascend at the pinned ref requires memfabric_hybrid==1.2.0,
 # memcache_hybrid==1.2.0 and arctic-inference==0.1.1, none of which are on PyPI
 # (they are optional kvpool/speculative-decoding backends published elsewhere),
 # so a --no-index install of the unfiltered file cannot resolve and the build
@@ -351,7 +753,7 @@ RUN python3 -c 'import importlib.metadata as md, torch, triton; names = {(d.meta
 # its bf16 and PIPE_FIX kernels for a dav-m200 core and needs a stub
 # translation unit to link. None of that applies here:
 #
-#   * csrc/kernels/unsupported_310p.cpp does not exist on vllm-ascend@main at
+#   * csrc/kernels/unsupported_310p.cpp does not exist at the pinned ref at
 #     all (HTTP 404) - the 310P handling moved into CMake gates.
 #   * Those gates already know this SoC. With SOC_VERSION matching ascend950,
 #     upstream CMakeLists.txt takes the same branch as the 310P in three
@@ -465,12 +867,22 @@ RUN --mount=type=bind,source=common/docker/driver_plumbing.sh,target=/tmp/driver
 # ENV. Both land after the kernel compile, so editing them rebuilds in seconds.
 COPY common/patches/ascend_setenv_nounset.sh /usr/local/lib/ascend/setenv.sh
 COPY common/docker/compiler_env.sh           /usr/local/lib/ascend/compiler_env.sh
+# Kept in the image, not just bind-mounted at build time: verify-runtime.sh runs
+# its --check on the target host, where the driver IS mounted and the full
+# `import acl` must therefore succeed.
+COPY common/docker/pyacl_wire.py             /usr/local/lib/ascend/pyacl_wire.py
 COPY targets/target-950pr/entrypoint.sh      /usr/local/bin/entrypoint.sh
 COPY targets/target-950pr/verify_runtime.sh  /usr/local/bin/verify-runtime.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh /usr/local/bin/verify-runtime.sh
 
 # Fail the build, not the deployment, if the offline install did not take.
-RUN python3 -c "import torch; import torch_npu; import vllm; import vllm_ascend; print('ALL RUNTIME IMPORTS SUCCEEDED')"
+#
+# pyACL is checked by module resolution rather than by importing it: the import
+# itself needs the host driver, which this image deliberately does not carry
+# (see 4a). find_spec proves the path wiring - the thing the build controls -
+# and stage 4a has already failed the build if the extension's symbols did not
+# match the CANN libraries beside it.
+RUN python3 -c "import importlib.util as u; import torch; import torch_npu; import vllm; import vllm_ascend; s = u.find_spec('acl'); assert s is not None, 'pyACL (import acl) does not resolve - see stage 4a'; print('pyACL at', list(s.submodule_search_locations or [s.origin])[0]); print('ALL RUNTIME IMPORTS SUCCEEDED')"
 
 WORKDIR /workspace
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]

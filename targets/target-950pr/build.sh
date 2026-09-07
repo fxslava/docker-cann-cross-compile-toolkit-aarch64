@@ -6,13 +6,25 @@
 #   ./targets/target-950pr/build.sh --save out.tar.gz      build, then export via pigz
 #   ./targets/target-950pr/build.sh --no-cache             anything unrecognised goes to buildx
 #
+# The release deliverable, built and exported in one go:
+#   ./targets/target-950pr/build.sh --no-cache \
+#       --save artifacts/vllm-ascend-950pr-x86_64-offline.tar.gz
+#
 # Environment:
-#   TAG         image tag        (default vllm-ascend-950pr:x86_64-offline)
-#   CONTEXT     build context    (default the repository root, two levels up)
-#   DEPS_DIR    offline payload  (default $CONTEXT/deps/950pr-x86_64)
-#   TARGET_DIR  image assets     (default $CONTEXT/targets/target-950pr)
-#   SOC_VERSION build SoC        (default ascend950dt_9582)
-#   BASE_IMAGE  base             (default ubuntu:22.04)
+#   TAG          image tag       (default vllm-ascend-950pr:x86_64-offline)
+#   CONTEXT      build context   (default the repository root, two levels up)
+#   DEPS_DIR     offline payload (default $CONTEXT/deps/950pr-x86_64)
+#   TARGET_DIR   image assets    (default $CONTEXT/targets/target-950pr)
+#   SOC_VERSION  build SoC       (default ascend950dt_9582)
+#   BASE_IMAGE   base            (default ubuntu:22.04)
+#   CANN_VERSION CANN release    (default 9.2.0; must match the staged payload
+#                                 AND the driver on the target host)
+#   CANN_APT_VERSION exact Debian version of the CANN packages
+#                                 (default 9.2.0-beta.2). CANN_VERSION is the
+#                                 release LINE and drives on-disk paths;
+#                                 CANN_APT_VERSION is the package version and
+#                                 drives the staged filenames and the sha256
+#                                 pins. A beta makes the two differ.
 #
 # UNLIKE targets/target-310p/build.sh THERE IS NO QEMU HERE. Host and target are both
 # x86_64, so there is no binfmt registration, no emulation tax and no
@@ -37,7 +49,8 @@ TARGET_DIR="${TARGET_DIR:-$CONTEXT/targets/target-950pr}"
 TAG="${TAG:-vllm-ascend-950pr:x86_64-offline}"
 BASE_IMAGE="${BASE_IMAGE:-ubuntu:22.04}"
 SOC_VERSION="${SOC_VERSION:-ascend950dt_9582}"
-CANN_VERSION="${CANN_VERSION:-9.1.0}"
+CANN_VERSION="${CANN_VERSION:-9.2.0}"
+CANN_APT_VERSION="${CANN_APT_VERSION:-9.2.0-beta.2}"
 
 SAVE_TO=""
 EXTRA=()
@@ -80,7 +93,24 @@ fi
 # setup.py demands a value starting with ascend950. The vendor spelling
 # "Ascend950PR" matches nothing and produces a wrong-but-quiet build, so refuse
 # it here rather than three hundred seconds into a wheel compile.
+#
+# THE PR/DT SPLIT IS SEPARATE FROM THE CASE TRAP AND EASIER TO MISS. CANN 9.1.0
+# treats 950PR and 950DT as distinct SoC families - ascend950_list carries both
+# name spaces and platform_config has its own .ini for each part - and the
+# ACLNN kernel binaries this image compiles are keyed on the exact SOC_VERSION.
+# This target is named 950PR while upstream's default (inherited here) is a DT
+# part, so a DT value gets a warning: it may well be what you want on a DT
+# board, but on PR silicon it should be derived rather than inherited.
 case "$SOC_VERSION" in
+    ascend950dt_*)
+        echo "  soc      : $SOC_VERSION"
+        echo "             NOTE: that is a 950-DT part, and this target is named 950PR."
+        echo "             CANN 9.1.0 lists nine PR parts - ascend950pr_{9579,957b,957c,"
+        echo "             957d,9589,958a,958b,9599,950z} - with their own platform configs."
+        echo "             On a 950PR derive the value from the board instead:"
+        echo "                 npu-smi info -t board -i 0"
+        echo "             then (Chip Name + '_' + NPU Name), lowercased."
+        ;;
     ascend950*) echo "  soc      : $SOC_VERSION" ;;
     *) die "SOC_VERSION='$SOC_VERSION' does not start with lowercase 'ascend950'.
        vllm-ascend's CMake gates are case-sensitive; 'Ascend950PR' silently
@@ -89,21 +119,63 @@ case "$SOC_VERSION" in
        e.g. ascend950dt_9582 (what upstream's Dockerfile.a5 ships)." ;;
 esac
 
-# No patches for this target, by design: vllm-ascend@main handles ascend950 in
-# its own CMake gates and csrc/kernels/unsupported_310p.cpp does not exist
-# there. Fail loudly if someone copies the 310P patch set in.
-if [ -d "$TARGET_DIR/patches" ] && ls "$TARGET_DIR"/patches/*.patch >/dev/null 2>&1; then
-    die "$TARGET_DIR/patches/ contains patches. The 950 target applies none -
-       see the stage 6 note in Dockerfile.x86_64. Remove them or move them
-       behind an explicit flag before building."
+# NO vllm-ascend PATCHES for this target, by design: at the pinned ref
+# (releases/v0.27.1rc) it handles ascend950 in its own CMake gates and
+# csrc/kernels/unsupported_310p.cpp does not exist there. Fail loudly if someone
+# copies the 310P patch set in.
+#
+# ONE PATCH IS EXPECTED, AND IT IS NOT A vllm-ascend PATCH. It targets catlass -
+# vllm-ascend's third-party submodule - and it is applied by provision.sh when
+# the tree is STAGED, not here at build time, because that is where the catlass
+# checkout lives. It backports upstream catlass c89fe73d so the ascend950 flash
+# attention epilogues compile against CANN 9.2.0's Bisheng, which now requires
+# __attribute__((cce_simd_vf)) functions to be static. Without it three ops die
+# in the kernel compile. See the CATLASS_PATCH note in provision.sh.
+#
+# So the allowlist is by name: the catlass backport is known and expected, and
+# anything else in patches/ is still refused.
+CATLASS_PATCH_NAME="0001-catlass-simd-vf-static.patch"
+unexpected=""
+if [ -d "$TARGET_DIR/patches" ]; then
+    unexpected=$(find "$TARGET_DIR/patches" -maxdepth 1 -name '*.patch' \
+                 ! -name "$CATLASS_PATCH_NAME" -printf '%f\n' 2>/dev/null | sort)
 fi
-echo "  patches  : none (correct for this target)"
+if [ -n "$unexpected" ]; then
+    echo "ERROR: unexpected patches in $TARGET_DIR/patches/:" >&2
+    echo "$unexpected" | sed 's/^/  - /' >&2
+    die "the 950 target applies no vllm-ascend patches - see the stage 6 note in
+       Dockerfile.x86_64. Remove them, or move them behind an explicit flag."
+fi
+if [ -f "$TARGET_DIR/patches/$CATLASS_PATCH_NAME" ]; then
+    # It is applied at staging time, so assert the RESULT here rather than the
+    # patch's presence: a payload staged before the patch existed would build
+    # unpatched sources and fail forty minutes later in the kernel compile.
+    if grep -rqE '^[[:space:]]+__simd_vf__ (inline|void)' \
+         "$DEPS_DIR/src/vllm-ascend/csrc/third_party/catlass/include" 2>/dev/null; then
+        die "the staged catlass still has non-static __simd_vf__ members, which
+       CANN $CANN_APT_VERSION's Bisheng rejects. The catlass backport was not
+       applied to this payload. Re-stage it:
+           $TARGET_DIR/provision.sh src"
+    fi
+    echo "  patches  : catlass simd_vf backport (applied at staging; verified)"
+else
+    echo "  patches  : none"
+fi
 
 # --- offline payload, checked against the staging manifest ------------------
 MANIFEST="$TARGET_DIR/deps.manifest"
 [ -f "$MANIFEST" ] || die "missing $MANIFEST"
 
+# @CANN_VERSION@ IS EXPANDED BEFORE PARSING. The manifest used to name 9.1.0 in
+# four literal places, so moving the CANN line meant editing it as well as the
+# Dockerfile - and forgetting produced a build that checked for one release's
+# artefacts and then installed another's. One substitution keeps the two in step
+# by construction.
+manifest_expanded=$(sed -e "s/@CANN_APT_VERSION@/${CANN_APT_VERSION}/g" \
+                        -e "s/@CANN_VERSION@/${CANN_VERSION}/g" "$MANIFEST")
+
 missing=()
+pinned=0
 while IFS='|' read -r kind path bytes sha src; do
     case "${kind// /}" in ''|'#'*) continue ;; esac
     path="${path// /}"; bytes="${bytes// /}"
@@ -123,8 +195,38 @@ while IFS='|' read -r kind path bytes sha src; do
             # shellcheck disable=SC2086
             ls $full >/dev/null 2>&1 || missing+=("$path  <- ${src%% *}")
             ;;
+        pin)
+            # pin|<cann-apt-version>|<file>|<bytes>|<sha256>. The columns shift
+            # by one relative to the rows above, so they are read under their own
+            # names: `path` is the version, `bytes` the filename, `sha` the size
+            # and `src` the hash.
+            #
+            # KEYED ON CANN_APT_VERSION, NOT CANN_VERSION: a hash identifies one
+            # artefact, and 9.2.0-beta.1 and 9.2.0-beta.2 are different artefacts
+            # of the same 9.2.0 line. Keying on the line would apply beta.1's
+            # hashes to beta.2's files and fail the build for the wrong reason.
+            [ "${path}" = "$CANN_APT_VERSION" ] || continue
+            full="$DEPS_DIR/${bytes// /}"
+            if [ ! -f "$full" ]; then
+                missing+=("${bytes// /}  (pinned for CANN $path, not staged)")
+                continue
+            fi
+            if [ "$(stat -c%s "$full")" != "${sha// /}" ]; then
+                missing+=("${bytes// /}  (size $(stat -c%s "$full"), pinned $sha)")
+                continue
+            fi
+            # sha256sum over the 4.4 GB of CANN packages costs a few seconds
+            # and is the only thing standing between a truncated or substituted
+            # package and a ninety-minute build that fails at the very end.
+            actual=$(sha256sum "$full" | cut -d' ' -f1)
+            if [ "$actual" != "${src// /}" ]; then
+                missing+=("${bytes// /}  (sha256 $actual, pinned ${src// /})")
+                continue
+            fi
+            pinned=$((pinned + 1))
+            ;;
     esac
-done < "$MANIFEST"
+done <<< "$manifest_expanded"
 
 if [ "${#missing[@]}" -gt 0 ]; then
     printf 'ERROR: offline payload incomplete in %s\n' "$DEPS_DIR" >&2
@@ -132,9 +234,32 @@ if [ "${#missing[@]}" -gt 0 ]; then
     echo >&2
     echo "  The staging plan and the exact download URLs are in" >&2
     echo "  $MANIFEST and docs/target-950pr-x86_64.md." >&2
+    echo "  Stage it with:  CANN_VERSION=$CANN_VERSION \\" >&2
+    echo "                  CANN_APT_VERSION=$CANN_APT_VERSION $TARGET_DIR/provision.sh" >&2
     exit 1
 fi
 echo "  deps     : $(du -sh "$DEPS_DIR" | cut -f1) in $DEPS_DIR (manifest satisfied)"
+
+# --- one CANN release in the payload, and it is the one being built ---------
+# The toolkit, NNAL and the cann_extra libraries all land in a single lib64 and
+# are resolved by one loader. A payload carrying two releases produces an image
+# whose libraries disagree about their own ABI, and that surfaces as `undefined
+# symbol` at import time - not as anything the build log calls an error.
+stray_debs=$(find "$DEPS_DIR/cann_debs" -maxdepth 1 -name '*.deb' \
+             ! -name "*_${CANN_APT_VERSION}_*" -printf '%f\n' 2>/dev/null | sort)
+if [ -n "$stray_debs" ]; then
+    echo "ERROR: packages from another CANN release are staged next to ${CANN_APT_VERSION}:" >&2
+    echo "$stray_debs" | sed 's/^/  - /' >&2
+    die "remove them, or build with CANN_APT_VERSION set to the release you mean"
+fi
+if [ "$pinned" -gt 0 ]; then
+    echo "  cann     : $CANN_VERSION (apt $CANN_APT_VERSION, $pinned artefact(s) sha256-verified)"
+else
+    echo "  cann     : $CANN_VERSION (apt $CANN_APT_VERSION - NO sha256 pin in"
+    echo "             deps.manifest for this version; size-checked only. Add a"
+    echo "             'pin|$CANN_APT_VERSION|...' row once the artefacts are"
+    echo "             known-good - provision.sh prints the hashes.)"
+fi
 
 # --- CUDA gate: no NVIDIA wheels may enter an Ascend image ------------------
 # PyPI's x86_64 torch 2.10.0 declares fifteen nvidia-*-cu12 requirements gated
@@ -198,6 +323,7 @@ docker buildx build \
     --progress=plain \
     --build-arg BASE_IMAGE="$BASE_IMAGE" \
     --build-arg CANN_VERSION="$CANN_VERSION" \
+    --build-arg CANN_APT_VERSION="$CANN_APT_VERSION" \
     --build-arg SOC_VERSION="$SOC_VERSION" \
     -f "$TARGET_DIR/Dockerfile.x86_64" \
     -t "$TAG" \

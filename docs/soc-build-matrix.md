@@ -135,13 +135,13 @@ operator guide. Three findings there change what this section implies:
 
 | Knob | Where | 310P3 | 910B | 950 |
 |---|---|---|---|---|
-| CANN line | `provision.sh` / `build.sh` | `8.5.0` | `8.5.0` | **`9.1.0`** |
+| CANN line | `provision.sh` / `build.sh` | `8.5.0` | `8.5.0` | **`$CANN_VERSION` `9.2.0`, apt `$CANN_APT_VERSION` `9.2.0-beta.2`** |
 | image platform | `build.sh` `--platform` | `linux/arm64` (emulated) | `linux/arm64` | **`linux/amd64` (native)** |
 | `SOC_VERSION` | target `Dockerfile` `ARG` | `ascend310p3` | `ascend910b1`… | `ascend950dt_9582` |
-| `ASCEND_AICORE_ARCH` | target `Dockerfile` `ENV` | `dav-m200` | `dav-c220` | `dav-v300` |
+| `ASCEND_AICORE_ARCH` | target `Dockerfile` `ENV` | `dav-m200` | `dav-c220` | `dav-c310` (was `dav-v300`; corrected against CANN 9.1.0's platform_config) |
 | device-family assert | `verify_runtime.sh` | `_310P` | `A2` | `A5` |
 | kernel-exclusion patch | `targets/target-310p/patches/0001-…` | active | inert (gate does not match) | none — upstream builds unmodified |
-| `cann_extra` source image | target `provision.sh` | `…:8.5.0-310p-…` | needs the 910b tag | `…:9.1.0-950-ubuntu22.04-py3.10` |
+| `cann_extra` source image | target `provision.sh` | `…:8.5.0-310p-…` | needs the 910b tag | **no longer used** — `ascend-cann-950-ops` supplies the operator runtime from the apt repository; kept as an opt-in override |
 | ACLNN custom ops | `csrc/build_aclnn.sh` | not built | not built | **27 ops / 493 kernels** |
 | serving dtype | runtime `--dtype` | `float16` (forced) | bf16 or fp16 | checkpoint's own |
 

@@ -71,15 +71,15 @@ compiled against**. See [§9](#9-the-zero-cuda-guarantee).
 |---|---|---|
 | **Target SoC** | Ascend 310P3 (Atlas 300I, A1 / edge) | Ascend 950 (Atlas 350) |
 | **Device family** (`_build_info.__device_type__`) | `_310P` | `A5` |
-| **AI Core** | `dav-m200` | `dav-v300` — *unverified against CANN 9.1.0's own tables* |
+| **AI Core** | `dav-m200` | `dav-c310` — *verified against CANN 9.1.0's `platform_config`; was `dav-v300`, which exists in no CANN file* |
 | **`SOC_VERSION`** | `ascend310p3` | `ascend950dt_9582` |
 | **Image platform** | `linux/arm64` | `linux/amd64` |
 | **Host architecture** | x86_64 | x86_64 |
 | **Build strategy** | **Cross / emulated** — QEMU `binfmt`, plus a host-arch CANN unpacker stage | **Native** — no QEMU, no binfmt, no emulation tax |
 | **OS / interpreter** | Ubuntu 22.04 (jammy), Python 3.10 | Ubuntu 22.04 (jammy), Python 3.10 |
-| **CANN** | 8.5.0 toolkit | 9.1.0 toolkit **+ NNAL/ATB** |
+| **CANN** | 8.5.0 toolkit | `$CANN_VERSION` toolkit **+ Ascend950 ops + NNAL/ATB**, default **9.2.0** (apt `9.2.0-beta.2`, from Huawei's DevCloud apt repository — [why, and where it comes from](docs/target-950pr-x86_64.md#1a-cann-920-is-published--on-the-devcloud-apt-repository)) |
 | **torch / torch_npu** | 2.8.0+cpu / 2.8.0.post2 | 2.10.0+cpu / 2.10.0.post4 |
-| **vLLM / vllm-ascend** | v0.13.0 / v0.13.0 (**patched**) | v0.27.1 / `main` (**no patches**) |
+| **vLLM / vllm-ascend** | v0.13.0 / v0.13.0 (**patched**) | v0.27.1 / `releases/v0.27.1rc` @ `e61a5d7` (**no patches**) |
 | **Triton** | — | `triton-ascend` 3.2.2 (replaces NVIDIA triton) |
 | **Kernel compilation scope** | `ascendc_library(vllm_ascend_kernels)` **is** built; bf16/`PIPE_FIX` kernels excluded by a local patch. **No ACLNN custom-op package.** | `vllm_ascend_kernels` **skipped** by upstream's `ascend950` CMake gate; instead `csrc/build_aclnn.sh` builds **27 ACLNN ops → 493 kernel binaries** via `ccec`/`bisheng` |
 | **Patches applied** | 1 (`patches/0001-…-ascend310p-kernel-gates.patch`) | none, by design — `build.sh` refuses to start if any appear |
@@ -180,7 +180,7 @@ Common to both `build.sh` scripts:
 | `TARGET_DIR` | `$CONTEXT/targets/target-310p` | `$CONTEXT/targets/target-950pr` |
 | `BASE_IMAGE` | `ubuntu:22.04` | `ubuntu:22.04` |
 | `UNPACKER_IMAGE` | `python:3.10-slim` | *(not used — native build)* |
-| `CANN_VERSION` | `8.5.0` | `9.1.0` |
+| `CANN_VERSION` | `8.5.0` | `9.2.0` — the release **line**, which drives on-disk paths. Pair it with `CANN_APT_VERSION` (default `9.2.0-beta.2`), the exact apt package version; `CANN_VERSION=9.1.0 CANN_APT_VERSION=9.1.0` builds the previous line and nothing else changes |
 | `SOC_VERSION` | `ascend310p3` (Dockerfile `ARG`) | `ascend950dt_9582` |
 
 Provisioning knobs are listed per target in
@@ -310,8 +310,9 @@ partial download resumes. Re-running after an interruption is always safe.
 
 | Path | Contents |
 |---|---|
-| `Ascend-cann-toolkit_9.1.0_linux-x86_64.run` | 1,298,337,341 B, SHA-256 pinned in `deps.manifest` |
-| `Ascend-cann-nnal_9.1.0_linux-x86_64.run` | 572,750,476 B — this is where **ATB** lives |
+| `cann_debs/ascend-cann-toolkit_$CANN_APT_VERSION_amd64.deb` | 9.2.0-beta.2: 1,395,916,760 B, SHA-256 pinned in `deps.manifest` |
+| `cann_debs/ascend-cann-950-ops_$CANN_APT_VERSION_amd64.deb` | the Ascend950 operator payload, 2,834,051,262 B, pinned |
+| `Ascend-cann-nnal_$CANN_VERSION_linux-x86_64.run` | 9.1.0: 572,750,476 B — this is where **ATB** lives |
 | `cann_extra/lib64/` | **26 libraries the standalone toolkit omits** |
 | `apt_debs/` | amd64 jammy `.deb` closure + index |
 | `python_wheels/` | cp310 x86_64 wheelhouse + the built vLLM wheel |
@@ -438,7 +439,7 @@ docker buildx build \
     --network=none \
     --progress=plain \
     --build-arg BASE_IMAGE=ubuntu:22.04 \
-    --build-arg CANN_VERSION=9.1.0 \
+    --build-arg CANN_VERSION=9.2.0 \
     --build-arg SOC_VERSION=ascend950dt_9582 \
     -f targets/target-950pr/Dockerfile.x86_64 \
     -t vllm-ascend-950pr:x86_64-offline \
@@ -943,7 +944,7 @@ the Git Bash side writes to the Windows temp directory instead.
 | `exec /bin/sh: exec format error` on an arm64 container | `binfmt_misc` cleared (WSL restart). Re-register with `multiarch/qemu-user-static --reset -p yes`. |
 | `buildx does not offer linux/arm64` | Same cause; `docker buildx ls` abbreviates the platform column, so check `docker buildx inspect --bootstrap`. |
 | Build fails on a missing `deps/` row | Run `provision.sh`. The 950PR preflight names the exact file and its source URL. |
-| HTTP 403 from the Huawei OBS bucket | **The version string does not exist** — the bucket answers 403, not 404, for a missing key. Probe with a range request before assuming access issues. |
+| HTTP 403 from the Huawei OBS bucket | **The version string does not exist there** — the bucket answers 403, not 404, for a missing key, and it denies LIST, so 403 cannot be told apart from "private". Probe with a range request before assuming access issues — and check the DevCloud **apt** repository, which is a separate channel and carries releases the bucket does not (the whole 9.2.0 line, and every `*-ops` package). |
 | CANN `.run` truncated after a dropped transfer | `curl --retry` with `-C -` restarts at byte 0. Use the `fetch.sh` primitives, which resume from the current file size. |
 | pip crawls at a few KB/s | Dead IPv6 egress, not the link. See [§10](#10-windows--wsl-2-operator-notes). |
 | `import torch` dies with `undefined symbol: HcclReduceScatter` | `libhccl.so` missing — the toolkit does not ship the aggregate. Re-stage `cann_extra`. |

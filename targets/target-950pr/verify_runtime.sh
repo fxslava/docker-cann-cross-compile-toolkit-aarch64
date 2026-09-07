@@ -5,22 +5,37 @@
 #   docker run --rm vllm-ascend-950pr:x86_64-offline verify
 #   docker run --rm --entrypoint verify-runtime.sh <image>
 #
-# Ten assertions, the same shape as the 310P suite in
+# Thirteen assertions, the same shape as the 310P suite in
 # targets/target-310p/verify_runtime.sh:
 #
 #   1 x86_64 architecture
 #   2 Python 3.10 / 3.11 / 3.12
 #   3 CANN 9.x runtime libraries: libascendcl.so (x86-64 ELF) and libhccl.so
-#   4 offline torch / torch_npu / vllm / vllm_ascend imports
-#   5 vllm_ascend built for device family A5, not _310P
-#   6 vllm_ascend_C built into the wheel
-#   7 vllm_ascend_C has no unresolved symbols beyond the Python C API
-#   8 no 310P stub symbols, i.e. no 310P gating patch leaked into this target
-#   9 ACLNN custom-op package installed under _cann_ops_custom
-#  10 vllm CLI present and `vllm serve --help` works
+#   4 the image's CANN release matches the CANN_VERSION it was built as,
+#     and its packages came from the release they claim (.cann-provenance)
+#   5 the toolkit is reachable under every path this stack resolves it through
+#   6 pyACL: `import acl` resolves with PYTHONPATH scrubbed, and loads with no
+#     unresolved symbols
+#   7 offline torch / torch_npu / vllm / vllm_ascend imports
+#   8 vllm_ascend built for device family A5, not _310P
+#   9 vllm_ascend_C built into the wheel
+#  10 vllm_ascend_C has no unresolved symbols beyond the Python C API
+#  11 no 310P stub symbols, i.e. no 310P gating patch leaked into this target
+#  12 ACLNN custom-op package installed under _cann_ops_custom
+#  13 vllm CLI present and `vllm serve --help` works
 #
-# An eleventh assertion -- importing vllm_ascend_C itself -- is reachable only
-# where /dev/davinci* exists, so a build host sees 10/10 and an NPU host 11/11.
+# One further assertion -- importing vllm_ascend_C itself -- is reachable only
+# where /dev/davinci* exists, and the pyACL check tightens from "resolves" to
+# "imports" there, so a build host sees 13/13 and an NPU host 14/14.
+#
+# WHY pyACL IS CHECKED SEPARATELY AND EARLY. `acl` is not a pip package: CANN
+# ships it with the toolkit, built against that release's libascendcl.so, and
+# vllm-ascend imports it at module scope (vllm_ascend/device_allocator/camem.py
+# does `from acl.rt import memcpy` for the CANN-mem sleep-mode allocator). So it
+# is on the inference path, it is the first thing to break when the image's CANN
+# release and the host's driver disagree, and the error it produces then --
+# `undefined symbol` out of a .so several imports deep -- is nearly unreadable
+# if the first thing that reports it is `import vllm_ascend`.
 #
 # Checks that genuinely need hardware are reported as INFO, never as failures,
 # so a clean run on a build host is not a claim that the NPU works -- only that
@@ -50,8 +65,8 @@ step() { echo; echo "=== $* ==="; }
 
 TK="${ASCEND_TOOLKIT_HOME:-/usr/local/Ascend/ascend-toolkit/latest}"
 
-# Counted up front because step 4 has to know: the native extension can only be
-# loaded where a device exists.
+# Counted up front because steps 4 and 7 have to know: pyACL needs the host
+# driver and the native extension can only be loaded where a device exists.
 NDEV=0
 for dev in /dev/davinci[0-9]*; do [ -c "$dev" ] && NDEV=$((NDEV+1)); done
 
@@ -105,7 +120,18 @@ fi
 if [ -f "$TK/../ascend_toolkit_install.info" ]; then
     info "$(tr '\n' ' ' < "$TK/../ascend_toolkit_install.info")"
 fi
-ver=$(sed -n 's/^version=//p' "$TK/../ascend_toolkit_install.info" 2>/dev/null)
+# The installed release, read wherever the toolkit put the file. Two locations
+# are in use across releases: <toolkit>/ascend_toolkit_install.info (what this
+# suite has always read) and <toolkit>/latest/<arch>-linux/ascend_toolkit_install.info
+# (what upstream's own issue templates and collect_env.py read).
+ver=""
+for f in "$TK/../ascend_toolkit_install.info" \
+         "$TK/ascend_toolkit_install.info" \
+         "$TK/x86_64-linux/ascend_toolkit_install.info"; do
+    [ -f "$f" ] || continue
+    ver=$(sed -n 's/^version=//p' "$f" | head -1)
+    [ -n "$ver" ] && { info "CANN release $ver (from ${f#"$TK"/})"; break; }
+done
 case "$ver" in
     9.*) info "CANN version $ver (9.x, as this target requires)" ;;
     "")  info "CANN version not readable from ascend_toolkit_install.info" ;;
@@ -115,7 +141,121 @@ esac
     && info "nnal/atb present (ATB attention paths available)" \
     || info "nnal/atb absent - upstream's A5 image sources it before building"
 
-step "3. Offline runtime imports"
+step "3. CANN release and toolkit paths"
+# THIS IS THE CHECK THAT WOULD HAVE CAUGHT THE ORIGINAL DEPLOYMENT FAILURE.
+# An image built one CANN minor behind the host's driver looks completely
+# healthy until the first call into the runtime, so the release is asserted
+# against what the build was told to produce rather than merely printed.
+#
+# CANN_VERSION is baked into the image as an ENV by the Dockerfile. When it is
+# unset - an image built before that, or a hand-run of this script outside one -
+# the check degrades to INFO rather than inventing an expectation.
+if [ -n "${CANN_VERSION:-}" ]; then
+    case "$ver" in
+        "")                  info "cannot compare: no version string in the install info" ;;
+        "${CANN_VERSION}"*)  ok "image CANN release $ver matches the CANN_VERSION it was built as" ;;
+        *)                   bad "image was built as CANN ${CANN_VERSION} but carries $ver" ;;
+    esac
+else
+    info "CANN_VERSION is not set in this image; skipping the release assertion"
+fi
+
+# The paths the stack resolves the toolkit through. All of these must land on
+# the same tree - vllm-ascend reaches for $ASCEND_HOME_PATH first
+# (csrc/build.sh:1338, csrc/cmake/config.cmake:26, csrc/cmake/dependencies.cmake:13)
+# and falls back to /usr/local/Ascend/latest, while its nightly multi-node
+# runner globs /usr/local/Ascend/cann-* for the optional ascendnpu-ir set_env.sh.
+#
+# cann-<version> and the unversioned `cann` are not aliases this repo invented:
+# Huawei's own 9.x images install the toolkit AT /usr/local/Ascend/cann-<version>
+# and set ASCEND_TOOLKIT_HOME to it, with /usr/local/Ascend/cann symlinked
+# alongside - and csrc/attention/k2q_csr/README.md:44 tells developers to source
+# set_env.sh from that unversioned name.
+#
+# ON CANN 9.2.0 THE INSTALLER PRODUCES THAT LAYOUT ITSELF, which it did not on
+# the 8.x/9.1 line: the real tree is /usr/local/Ascend/cann-<APT version>
+# (cann-9.2.0-beta.2 - the package version, betas included), `cann` points at
+# it, and ascend-toolkit/latest points at `cann`. Dockerfile stage 3c adds the
+# names that are still missing - notably cann-<CANN_VERSION>, the release LINE -
+# resolving each one to the real directory rather than to another symlink, which
+# is what keeps `cann` from being relinked into a loop through
+# ascend-toolkit/latest. All of it is asserted here rather than assumed.
+paths_ok=1
+cann_dir_path=""
+[ -n "${CANN_VERSION:-}" ] && cann_dir_path="/usr/local/Ascend/cann-${CANN_VERSION}"
+for p in "${ASCEND_TOOLKIT_HOME:-/usr/local/Ascend/ascend-toolkit/latest}" \
+         "${ASCEND_HOME_PATH:-}" \
+         "/usr/local/Ascend/ascend-toolkit/latest" \
+         "/usr/local/Ascend/latest" \
+         "/usr/local/Ascend/cann" \
+         "$cann_dir_path"; do
+    # An empty entry means "not applicable to this image" - ASCEND_HOME_PATH
+    # unset, or no CANN_VERSION to build the cann-<v> name from - not a failure.
+    [ -n "$p" ] || continue
+    if [ -e "$p/lib64/libascendcl.so" ]; then
+        info "toolkit reachable at $p"
+    else
+        info "NOT reachable: $p/lib64/libascendcl.so"
+        paths_ok=0
+    fi
+done
+[ "$paths_ok" -eq 1 ] \
+    && ok "every path this stack resolves CANN through lands on the toolkit" \
+    || bad "at least one CANN path does not resolve (see the INFO lines above)"
+
+# WHERE THE CANN PACKAGES CAME FROM. Dockerfile stage 3 installs the vendor
+# .run out of each official .deb rather than letting dpkg do it (the postinst
+# omits --quiet and stops on the EULA), so `dpkg -l` knows nothing about CANN
+# and this file is the only record. It carries the repository, the exact apt
+# version and the sha256 of each package that was installed.
+if [ -f /usr/local/Ascend/.cann-provenance ]; then
+    while IFS= read -r line; do
+        case "$line" in \#*|"") continue ;; esac
+        info "provenance: $line"
+    done < /usr/local/Ascend/.cann-provenance
+    prov_apt=$(sed -n 's/^cann_apt_version=//p' /usr/local/Ascend/.cann-provenance | head -1)
+    if [ -n "${CANN_APT_VERSION:-}" ] && [ -n "$prov_apt" ]; then
+        if [ "$prov_apt" = "$CANN_APT_VERSION" ]; then
+            ok "CANN packages are ${prov_apt}, which is what this image was built as"
+        else
+            bad "image is built as CANN_APT_VERSION=${CANN_APT_VERSION} but its packages are ${prov_apt}"
+        fi
+    fi
+else
+    info "no /usr/local/Ascend/.cann-provenance - image predates the apt-sourced payload"
+fi
+
+step "4. pyACL (import acl)"
+# common/docker/pyacl_wire.py is copied into the image so this check runs the
+# same discovery and classification the build used. Its exit codes:
+#   0  import acl succeeded outright
+#   2  wiring is correct, the import needs the host driver, no NPU here
+#   1  anything else - not found, unresolved symbols, or a real breakage
+if [ -f /usr/local/lib/ascend/pyacl_wire.py ]; then
+    pyacl_out=$(python3 /usr/local/lib/ascend/pyacl_wire.py --check 2>&1)
+    pyacl_rc=$?
+    printf '%s\n' "$pyacl_out" | sed 's/^/  [INFO] /'
+    case "$pyacl_rc" in
+        0) ok "pyACL imports: 'import acl' and 'from acl.rt import memcpy' both work" ;;
+        2) if [ "$NDEV" -gt 0 ]; then
+               bad "pyACL needs the driver and $NDEV NPU device(s) are present - the driver is not mounted correctly"
+           else
+               ok "pyACL resolves on sys.path (import deferred: no /dev/davinci* on this host)"
+               info "on the 950PR itself this must complete; re-run the suite there"
+           fi ;;
+        *) bad "pyACL is not usable - see the lines above" ;;
+    esac
+else
+    # Fall back to the property that matters most, so an older image still
+    # reports something meaningful rather than skipping the check.
+    if python3 -c "import importlib.util, sys; sys.exit(0 if importlib.util.find_spec('acl') else 1)" 2>/dev/null; then
+        ok "pyACL resolves on sys.path (pyacl_wire.py absent; wiring checked only)"
+    else
+        bad "pyACL does not resolve and pyacl_wire.py is not in this image"
+    fi
+fi
+
+step "5. Offline runtime imports"
 # This is the acceptance check: every one of these must resolve with no network
 # and no NPU attached.
 if python3 -c "import torch; import torch_npu; import vllm; import vllm_ascend; print('ALL RUNTIME IMPORTS SUCCEEDED')" 2>/tmp/imports.log; then
@@ -125,10 +265,11 @@ else
     tail -20 /tmp/imports.log
 fi
 
-step "4. Versions and build info"
+step "6. Versions and build info"
 # `bad`, not a bare echo: the 310P suite prints an uncounted "[FAIL]" here,
 # which reads as a failure but does not move the total. Counting it keeps the
-# summary honest. On a healthy image this never fires, so the total stays 9.
+# summary honest. On a healthy image this never fires, so it adds nothing to
+# the total.
 python3 - <<'PY' 2>/dev/null || bad "version probe failed"
 import importlib
 
@@ -163,7 +304,7 @@ case "$dt" in
 esac
 info "SOC_VERSION at build time: ${SOC_VERSION:-<unset>}"
 
-step "5. Compiled extension"
+step "7. Compiled extension"
 # libvllm_ascend_kernels.so registers its device binaries from an ELF
 # constructor calling CANN's AscendCheckSoCVersion(). With no NPU,
 # aclrtGetSocName() returns NULL, that builds a std::string from it, and the
@@ -199,7 +340,7 @@ else
     bad "vllm_ascend_C native extension was not built"
 fi
 
-step "6. Operator set matches the ascend950 build gate"
+step "8. Operator set matches the ascend950 build gate"
 # READ THIS BEFORE 'FIXING' A FAILURE HERE.
 #
 # vllm-ascend@main puts ascend950 on the SAME CMake branch as ascend310p in
@@ -279,7 +420,7 @@ else
     info "skipping the vllm_ascend_C import: no NPU, so CANN's SoC check aborts"
 fi
 
-step "7. vLLM entrypoint"
+step "9. vLLM entrypoint"
 # `vllm serve --help` loads the platform plugin, which imports triton-ascend,
 # whose driver asks the NPU for its architecture. With no device attached that
 # returns NULL and raises
@@ -287,7 +428,7 @@ step "7. vLLM entrypoint"
 #     SystemError: <built-in function get_arch> returned NULL without setting
 #     an exception
 # This is the same class of hardware dependency as the vllm_ascend_C import in
-# step 5 -- a property of the Ascend stack, not of this image -- so on a host
+# step 7 -- a property of the Ascend stack, not of this image -- so on a host
 # with no /dev/davinci* it is reported, not counted as a failure. Where a
 # device IS present the check is enforced, because there it must work.
 if command -v vllm >/dev/null; then
@@ -306,7 +447,7 @@ else
     bad "vllm CLI missing"
 fi
 
-step "8. NPU hardware (informational)"
+step "10. NPU hardware (informational)"
 if [ "$NDEV" -gt 0 ]; then
     info "$NDEV NPU device node(s) visible"
     python3 -c "import torch, torch_npu; print('  [INFO] torch_npu device_count:', torch.npu.device_count())" 2>/dev/null \
